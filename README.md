@@ -181,7 +181,7 @@ The converter creates **multiple optimized files**:
    # Review schema
    cat twitter_falkordb_import/schema_info.json
    ```
-4. **Import into FalkorDB** using the generated CSV files (one file per label/type)
+4. **Import into FalkorDB** using the FalkorDB Rust loader (see [Loading Data into FalkorDB](#loading-data-into-falkordb) section below)
 
 ## Real Example: Twitter Dataset
 
@@ -228,6 +228,66 @@ Use `--verbose` flag for detailed logging:
 ```bash
 python neptune_to_falkordb_converter.py -i input -o output --verbose
 ```
+
+## Loading Data into FalkorDB
+
+After converting your Neptune data to CSV format using this tool, you can load it into FalkorDB using the high-performance **FalkorDB Rust Loader**.
+
+### FalkorDB Rust Loader
+
+The [FalkorDB Rust Loader](https://github.com/FalkorDB/FalkorDB-Loader-RS) is a command-line tool specifically designed for loading CSV files into FalkorDB with optimal performance and comprehensive error handling.
+
+#### Installation
+
+```bash
+git clone https://github.com/FalkorDB/FalkorDB-Loader-RS
+cd FalkorDB-Loader-RS
+cargo build --release
+```
+
+#### Basic Usage
+
+```bash
+# Load your converted CSV files into FalkorDB
+./target/release/falkordb-loader my_graph_name --csv-dir ./twitter_falkordb_import
+```
+
+#### Advanced Usage
+
+```bash
+# Load with custom settings
+./target/release/falkordb-loader my_graph_name \
+  --host localhost \
+  --port 6379 \
+  --csv-dir ./twitter_falkordb_import \
+  --batch-size 1000 \
+  --merge-mode \
+  --stats \
+  --progress-interval 500
+```
+
+#### Key Features
+
+- **High Performance**: Async batch processing with configurable batch sizes
+- **Schema Management**: Automatic index and constraint creation
+- **Merge Mode**: Support for upsert operations to handle duplicate data
+- **Progress Tracking**: Real-time progress reporting during loading
+- **Error Handling**: Comprehensive error handling with detailed logging
+- **Type Safety**: Automatic type inference for properties
+
+#### Workflow Integration
+
+1. **Convert Neptune data** using this Neptune-to-FalkorDB converter
+2. **Load into FalkorDB** using the Rust loader:
+   ```bash
+   # Convert
+   python neptune_to_falkordb_converter.py -i ./neptune_export -o ./falkordb_csv
+   
+   # Load
+   ./target/release/falkordb-loader my_social_graph --csv-dir ./falkordb_csv --stats
+   ```
+
+For detailed usage instructions and configuration options, visit the [FalkorDB Rust Loader repository](https://github.com/FalkorDB/FalkorDB-Loader-RS).
 
 ## Advanced Features
 
