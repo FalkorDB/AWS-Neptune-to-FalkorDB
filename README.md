@@ -281,7 +281,7 @@ cargo build --release
 2. **Load into FalkorDB** using the Rust loader:
    ```bash
    # Convert
-   python neptune_to_falkordb_converter.py -i ./neptune_export -o ./falkordb_csv
+   python3 neptune_to_falkordb_converter.py -i ./neptune_export -o ./falkordb_csv
    
    # Load
    ./target/release/falkordb-loader my_social_graph --csv-dir ./falkordb_csv --stats
