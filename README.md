@@ -31,13 +31,13 @@ chmod +x neptune_to_falkordb_converter.py
 ### Basic Usage
 
 ```bash
-python neptune_to_falkordb_converter.py --input-dir /path/to/neptune/export --output-dir /path/to/falkordb/output
+python3 neptune_to_falkordb_converter.py --input-dir /path/to/neptune/export --output-dir /path/to/falkordb/output
 ```
 
 ### With Verbose Logging
 
 ```bash
-python neptune_to_falkordb_converter.py -i ./twitter_neptune_data -o ./twitter_falkordb_data --verbose
+python3 neptune_to_falkordb_converter.py -i ./twitter_neptune_data -o ./twitter_falkordb_data --verbose
 ```
 
 ## Command Line Options
@@ -163,7 +163,7 @@ The converter creates **multiple optimized files**:
 1. **Export from Neptune** using Neptune Export Service
 2. **Convert to FalkorDB format**:
    ```bash
-   python neptune_to_falkordb_converter.py -i ./twitter_neptune_export -o ./twitter_falkordb_import
+   python3 neptune_to_falkordb_converter.py -i ./twitter_neptune_export -o ./twitter_falkordb_import
    ```
 3. **Review the output**:
    ```bash
@@ -189,7 +189,7 @@ Converting a Twitter social network dataset:
 
 ```bash
 # Convert Twitter Neptune export to FalkorDB format
-python neptune_to_falkordb_converter.py -i ./twitter_neptune_export -o ./twitter_falkordb --verbose
+python3 neptune_to_falkordb_converter.py -i ./twitter_neptune_export -o ./twitter_falkordb --verbose
 
 # Example output:
 # Converting nodes from 1 files: ['users.csv']
@@ -226,7 +226,7 @@ python neptune_to_falkordb_converter.py -i ./twitter_neptune_export -o ./twitter
 Use `--verbose` flag for detailed logging:
 
 ```bash
-python neptune_to_falkordb_converter.py -i input -o output --verbose
+python3 neptune_to_falkordb_converter.py -i input -o output --verbose
 ```
 
 ## Loading Data into FalkorDB
