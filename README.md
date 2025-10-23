@@ -1,4 +1,4 @@
-# Neptune to FalkorDB CSV Converter
+# AWS Neptune to FalkorDB CSV Converter
 
 This script converts Amazon Neptune Export Service CSV files into FalkorDB-compatible CSV format for easy data migration. The converter creates **separate CSV files for each node label and edge type**, optimizing the schema for each entity type.
 
