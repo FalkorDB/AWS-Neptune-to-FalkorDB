@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
-"""
-Neptune Export Service to FalkorDB CSV Converter
+"""Neptune Export Service -> FalkorDB (bulk-loader) CSV converter.
 
-This script converts Neptune Export Service CSV files into FalkorDB-compatible
-nodes and edges CSV format.
+This script converts Amazon Neptune Export Service CSV files into CSVs that can be
+loaded directly by the FalkorDB bulk loader (see ../falkordb-bulk-loader).
 
-Usage:
-    python neptune_to_falkordb_converter.py --input-dir <neptune_export_dir> --output-dir <falkordb_output_dir>
+Bulk loader schemaless CSV expectations:
+- Node CSVs: the first column is the unique node identifier, all remaining
+  columns are node properties. (Label is supplied by the loader CLI, not the
+  file contents.)
+- Relation CSVs: the first two columns are start and end node identifiers, all
+  remaining columns are relation properties. (Relation type is supplied by the
+  loader CLI.)
 
-Neptune Export Service typically produces:
-- vertices.csv (nodes)
-- edges.csv (relationships)
-- Additional metadata files
-
-FalkorDB expects:
-- nodes.csv with columns: id, labels, properties...
-- edges.csv with columns: source, target, type, properties...
+This converter:
+- Produces separate node files and relation files.
+- Avoids duplicating nodes across multiple label files by grouping nodes by their
+  *full label set* and generating a single file per unique label-set.
+- Writes a manifest file (bulk_loader_manifest.json) that an import helper script
+  can use to invoke the bulk loader with the correct -N/-R arguments.
 """
 
 import argparse
@@ -23,8 +25,9 @@ import csv
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Set, Any, Optional
+from typing import Dict, List, Set, Any, Optional, Tuple
 import logging
 
 # Configure logging
@@ -33,20 +36,56 @@ logger = logging.getLogger(__name__)
 
 
 class NeptuneToFalkorDBConverter:
-    def __init__(self, input_dir: str, output_dir: str):
+    MANIFEST_FILENAME = "bulk_loader_manifest.json"
+
+    def __init__(self, input_dir: str, output_dir: str, enforce_schema: bool = False):
         self.input_dir = Path(input_dir)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        
+
+        # If True, emit Neo4j-style schema headers (ID/START_ID/END_ID and typed properties)
+        # compatible with falkordb-bulk-loader's --enforce-schema mode.
+        self.enforce_schema = bool(enforce_schema)
+
         # Track all property names and labels/types
         self.node_properties: Set[str] = set()
         self.edge_properties: Set[str] = set()
         self.node_labels: Set[str] = set()
         self.edge_types: Set[str] = set()
-        
-        # Track node ID to labels mapping for edge label resolution
+
+        # Track node ID -> labels from Neptune (useful for reporting/debugging)
         self.node_id_to_labels: Dict[str, List[str]] = {}
-        
+
+        # Populated during conversion
+        self._generated_node_files: List[Dict[str, Any]] = []
+        self._generated_edge_files: List[Dict[str, Any]] = []
+
+    @staticmethod
+    def _safe_filename_part(s: str) -> str:
+        # Keep it simple and cross-platform; also avoids characters with special meaning.
+        return (
+            s.replace("/", "_")
+            .replace("\\", "_")
+            .replace(":", "_")
+            .replace("*", "_")
+            .replace("?", "_")
+            .replace('"', "_")
+            .replace("<", "_")
+            .replace(">", "_")
+            .replace("|", "_")
+            .strip()
+        )
+
+    @classmethod
+    def _labelset_filename(cls, labels: Tuple[str, ...]) -> str:
+        # We keep the 'nodes_' prefix to avoid collisions with relation type filenames.
+        joined = "__".join(cls._safe_filename_part(l) for l in labels)
+        return f"nodes_{joined}.csv"
+
+    @classmethod
+    def _edgetype_filename(cls, edge_type: str) -> str:
+        safe_type = cls._safe_filename_part(edge_type)
+        return f"edges_{safe_type}.csv"
     def find_neptune_files(self) -> Dict[str, List[Path]]:
         """Find Neptune export files in the input directory.
         
@@ -152,7 +191,63 @@ class NeptuneToFalkorDBConverter:
             return value.lower() == 'true'
         
         return value
-    
+
+    @staticmethod
+    def _infer_schema_type(values: List[Any]) -> str:
+        """Infer a safe bulk-loader schema type for a property column.
+
+        We infer conservatively to avoid --enforce-schema failures:
+        - BOOL only if all non-empty values are booleans
+        - ARRAY only if all non-empty values are lists
+        - DOUBLE if all non-empty values are numeric (int/float) and at least one is float
+        - INT if all non-empty values are ints
+        - otherwise STRING
+        """
+        non_null = [v for v in values if v is not None]
+        if not non_null:
+            return "STRING"
+
+        # bool is a subclass of int in Python; check it first.
+        if all(isinstance(v, bool) for v in non_null):
+            return "BOOL"
+
+        if all(isinstance(v, list) for v in non_null):
+            return "ARRAY"
+
+        numeric_types = (int, float)
+        if all(isinstance(v, numeric_types) and not isinstance(v, bool) for v in non_null):
+            if any(isinstance(v, float) for v in non_null):
+                return "DOUBLE"
+            return "INT"
+
+        return "STRING"
+
+    @staticmethod
+    def _format_value_for_schema(value: Any, schema_type: str) -> str:
+        if value is None:
+            return ""
+
+        if schema_type == "BOOL":
+            # bulk loader accepts true/false case-insensitively; keep it canonical.
+            return "true" if bool(value) else "false"
+
+        if schema_type == "ARRAY":
+            if isinstance(value, list):
+                return json.dumps(value)
+            # If the column was marked ARRAY but we got a non-list value, stringify it.
+            # (This is still bracketed? No, but better than crashing during conversion.)
+            return str(value)
+
+        if schema_type in ("INT", "DOUBLE"):
+            return str(value)
+
+        # STRING
+        if isinstance(value, (dict, list)):
+            return json.dumps(value)
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        return str(value)
+
     def extract_labels_from_neptune_row(self, row: Dict[str, str]) -> List[str]:
         """Extract node labels from Neptune row."""
         labels = []
@@ -191,40 +286,45 @@ class NeptuneToFalkorDBConverter:
         return [l for l in labels if l]  # Remove empty strings
     
     def convert_nodes(self, node_files: List[Path]) -> None:
-        """Convert Neptune vertices to FalkorDB nodes format, creating separate files per label."""
+        """Convert Neptune vertices to bulk-loader compatible node CSVs.
+
+        We must not emit the same node ID in multiple node files, as the bulk loader
+        requires node identifiers to be unique across all node inputs.
+
+        To preserve multi-label semantics, nodes are grouped by their *full label set*
+        and a node appears in exactly one output file.
+        """
         logger.info(f"Converting nodes from {len(node_files)} files: {[f.name for f in node_files]}")
-        
-        # Track properties per label to optimize CSV structure
-        label_properties = {}
-        label_data = {}  # Store rows per label
-        
+
+        # Accumulate a single, merged record per node ID across all Neptune node inputs.
+        # This allows multi-label nodes that appear in multiple input files to be grouped
+        # into a single output file with the combined label set.
+        nodes_by_id: Dict[str, Dict[str, Any]] = {}
+
         # Process each node file
         for vertices_file in node_files:
             logger.info(f"Processing node file: {vertices_file.name}")
-            
-            # First pass: collect all properties, labels, and organize data by label
+
             with open(vertices_file, 'r', encoding='utf-8') as f:
-                # Check if file uses pipe delimiter
                 first_line = f.readline().strip()
                 f.seek(0)
-                
+
                 # Detect delimiter - check if it's the line number format (1|header,data,data)
                 logger.debug(f"Delimiter detection for {vertices_file.name}: first_line={repr(first_line)}")
-                logger.debug(f"Detection conditions: startswith_1_pipe={first_line.startswith('1|')}, has_comma={',' in first_line}, has_pipe={'|' in first_line}")
-                
+                logger.debug(
+                    f"Detection conditions: startswith_1_pipe={first_line.startswith('1|')}, has_comma={',' in first_line}, has_pipe={'|' in first_line}"
+                )
+
                 if first_line.startswith('1|') and ',' in first_line:
                     logger.debug(f"Using line number removal logic for {vertices_file.name}")
-                    # Skip the line number and parse as comma-delimited
-                    # Read all lines and remove line numbers
                     lines = f.readlines()
                     f.seek(0)
-                    # Write cleaned lines back
                     import io
+
                     cleaned_content = io.StringIO()
                     for line in lines:
                         if '|' in line and line[0].isdigit():
-                            # Remove line number prefix (e.g., "1|" -> "")
-                            cleaned_line = line[line.find('|')+1:]
+                            cleaned_line = line[line.find('|') + 1 :]
                             cleaned_content.write(cleaned_line)
                         else:
                             cleaned_content.write(line)
@@ -232,138 +332,171 @@ class NeptuneToFalkorDBConverter:
                     reader = csv.DictReader(cleaned_content)
                 elif '|' in first_line and not first_line.startswith('1|'):
                     logger.debug(f"Using pure pipe-delimited logic for {vertices_file.name}")
-                    # Pure pipe-delimited (Neptune export format)
                     reader = csv.DictReader(f, delimiter='|')
                 else:
                     logger.debug(f"Using standard comma-delimited logic for {vertices_file.name}")
-                    # Standard comma-delimited
                     reader = csv.DictReader(f)
-                
+
                 logger.debug(f"Headers for {vertices_file.name}: {reader.fieldnames}")
-                
+
                 for row in reader:
-                    # Extract labels
                     labels = self.extract_labels_from_neptune_row(row)
                     if not labels:
-                        labels = ['UnlabeledNode']  # Default label for nodes without explicit labels
-                    
-                    self.node_labels.update(labels)
-                    
-                    # Get node ID
+                        labels = ["UnlabeledNode"]
+
+                    labels_set = {l for l in labels if l}
+                    if not labels_set:
+                        labels_set = {"UnlabeledNode"}
+
                     node_id = row.get('~id') or row.get('id') or row.get('vertex_id')
                     if not node_id:
                         logger.warning(f"No ID found for row: {row}")
                         continue
-                    
-                    # Extract properties (skip Neptune system columns)
-                    node_properties = {}
+
+                    node_id = str(node_id)
+
+                    # Initialize merged record if needed
+                    if node_id not in nodes_by_id:
+                        nodes_by_id[node_id] = {"labels": set(), "properties": {}}
+
+                    # Merge labels
+                    nodes_by_id[node_id]["labels"].update(labels_set)
+                    self.node_labels.update(labels_set)
+
+                    # Merge properties
+                    merged_props: Dict[str, str] = nodes_by_id[node_id]["properties"]
                     for col, value in row.items():
-                        if not col.startswith('~') and col not in ['id', 'label', 'labels'] and value:
-                            # Strip type annotations from column names (e.g., "city:string" -> "city")
-                            clean_col = col.split(':')[0] if ':' in col else col
-                            self.node_properties.add(clean_col)
-                            node_properties[clean_col] = value
-                    
-                    # Store node ID to labels mapping for edge processing
-                    self.node_id_to_labels[node_id] = labels
-                    
-                    # Store data for each label this node has
-                    for label in labels:
-                        if label not in label_data:
-                            label_data[label] = []
-                            label_properties[label] = set()
-                        
-                        # Add this node's data to this label's collection
-                        node_data = {
-                            'id': node_id,
-                            'labels': labels,  # Keep all labels for this node
-                            'properties': node_properties
-                        }
-                        label_data[label].append(node_data)
-                        
-                        # Track properties used by this label
-                        label_properties[label].update(node_properties.keys())
-        
-        # Create separate CSV files for each label
-        created_files = []
-        for label in sorted(self.node_labels):
-            if label not in label_data:
-                logger.warning(f"Label '{label}' found but has no associated data")
-                continue
-            
-            # Create filename safe for filesystem
-            safe_label = label.replace('/', '_').replace('\\', '_').replace(':', '_').replace('*', '_').replace('?', '_').replace('"', '_').replace('<', '_').replace('>', '_').replace('|', '_')
-            nodes_output = self.output_dir / f'nodes_{safe_label}.csv'
-            
-            # Prepare headers specific to this label
-            label_specific_properties = sorted(label_properties[label])
-            headers = ['id', 'labels'] + label_specific_properties
-            
+                        if col.startswith('~') or col in ['id', 'label', 'labels']:
+                            continue
+                        if value is None or value == "":
+                            continue
+
+                        clean_col = col.split(':')[0] if ':' in col else col
+                        self.node_properties.add(clean_col)
+
+                        # Prefer the first non-empty value; log conflicts at debug level.
+                        if clean_col not in merged_props:
+                            merged_props[clean_col] = value
+                        elif merged_props[clean_col] != value:
+                            logger.debug(
+                                f"Conflicting values for node '{node_id}' property '{clean_col}': "
+                                f"keeping '{merged_props[clean_col]}', ignoring '{value}'"
+                            )
+
+        # Group merged nodes by their final label set
+        labelset_properties: Dict[Tuple[str, ...], Set[str]] = {}
+        labelset_data: Dict[Tuple[str, ...], List[Dict[str, Any]]] = {}
+
+        for node_id, node in nodes_by_id.items():
+            labels_key = tuple(sorted(node.get("labels") or {"UnlabeledNode"}))
+            self.node_id_to_labels[node_id] = list(labels_key)
+
+            if labels_key not in labelset_data:
+                labelset_data[labels_key] = []
+                labelset_properties[labels_key] = set()
+
+            props: Dict[str, str] = node.get("properties", {})
+            labelset_data[labels_key].append({"id": node_id, "properties": props})
+            labelset_properties[labels_key].update(props.keys())
+
+        # Write one CSV per unique label set
+        created_files: List[str] = []
+        self._generated_node_files = []
+
+        for labels_key in sorted(labelset_data.keys(), key=lambda t: "::".join(t)):
+            out_name = self._labelset_filename(labels_key)
+            nodes_output = self.output_dir / out_name
+
+            props = sorted(labelset_properties.get(labels_key, set()))
+
+            prop_types: Dict[str, str] = {}
+            if self.enforce_schema:
+                for prop in props:
+                    values: List[Any] = []
+                    for node_data in labelset_data[labels_key]:
+                        raw_val = node_data["properties"].get(prop, "")
+                        if raw_val == "":
+                            continue
+                        values.append(self.parse_neptune_property_value(raw_val))
+                    prop_types[prop] = self._infer_schema_type(values)
+
+                headers = ["id:ID"] + [f"{prop}:{prop_types[prop]}" for prop in props]
+            else:
+                headers = ["id"] + props
+
             with open(nodes_output, 'w', newline='', encoding='utf-8') as out_f:
                 writer = csv.writer(out_f)
                 writer.writerow(headers)
-                
-                for node_data in label_data[label]:
-                    # Build output row
-                    labels_str = ';'.join(node_data['labels']) if node_data['labels'] else ''
-                    output_row = [node_data['id'], labels_str]
-                    
-                    # Add properties specific to this label
-                    for prop in label_specific_properties:
-                        value = node_data['properties'].get(prop, '')
-                        if value:
-                            parsed_value = self.parse_neptune_property_value(value)
+
+                for node_data in labelset_data[labels_key]:
+                    output_row: List[str] = [node_data["id"]]
+                    for prop in props:
+                        raw_val = node_data["properties"].get(prop, "")
+                        if raw_val == "":
+                            output_row.append("")
+                            continue
+
+                        parsed_value = self.parse_neptune_property_value(raw_val)
+                        if self.enforce_schema:
+                            output_row.append(
+                                self._format_value_for_schema(parsed_value, prop_types[prop])
+                            )
+                        else:
                             if isinstance(parsed_value, (dict, list)):
                                 output_row.append(json.dumps(parsed_value))
                             else:
                                 output_row.append(str(parsed_value))
-                        else:
-                            output_row.append('')
-                    
+
                     writer.writerow(output_row)
-            
-            created_files.append(nodes_output.name)
-            logger.info(f"Created {nodes_output} with {len(label_data[label])} nodes")
-        
+
+            created_files.append(out_name)
+            node_manifest_entry: Dict[str, Any] = {
+                "file": out_name,
+                "labels": list(labels_key),
+                "count": len(labelset_data[labels_key]),
+                "properties": props,
+            }
+            if self.enforce_schema:
+                node_manifest_entry["property_types"] = prop_types
+            self._generated_node_files.append(node_manifest_entry)
+
+            logger.info(
+                f"Created {nodes_output} with {len(labelset_data[labels_key])} nodes (labels={list(labels_key)})"
+            )
+
         logger.info(f"Created {len(created_files)} node files: {created_files}")
         logger.info(f"Found {len(self.node_labels)} unique node labels: {sorted(self.node_labels)}")
         logger.info(f"Found {len(self.node_properties)} unique node properties: {sorted(self.node_properties)}")
     
     def convert_edges(self, edge_files: List[Path]) -> None:
-        """Convert Neptune edges to FalkorDB edges format, creating separate files per edge type."""
+        """Convert Neptune edges to bulk-loader compatible relation CSVs."""
         logger.info(f"Converting edges from {len(edge_files)} files: {[f.name for f in edge_files]}")
-        
-        # Track properties per edge type to optimize CSV structure
-        type_properties = {}
-        type_data = {}  # Store rows per edge type
-        
-        # Process each edge file
+
+        type_properties: Dict[str, Set[str]] = {}
+        type_data: Dict[str, List[Dict[str, Any]]] = {}
+
         for edges_file in edge_files:
             logger.info(f"Processing edge file: {edges_file.name}")
-            
-            # First pass: collect all properties, edge types, and organize data by type
+
             with open(edges_file, 'r', encoding='utf-8') as f:
-                # Check if file uses pipe delimiter
                 first_line = f.readline().strip()
                 f.seek(0)
-                
-                # Detect delimiter - check if it's the line number format (1|header,data,data)
+
                 logger.debug(f"Delimiter detection for {edges_file.name}: first_line={repr(first_line)}")
-                logger.debug(f"Detection conditions: startswith_1_pipe={first_line.startswith('1|')}, has_comma={',' in first_line}, has_pipe={'|' in first_line}")
-                
+                logger.debug(
+                    f"Detection conditions: startswith_1_pipe={first_line.startswith('1|')}, has_comma={',' in first_line}, has_pipe={'|' in first_line}"
+                )
+
                 if first_line.startswith('1|') and ',' in first_line:
                     logger.debug(f"Using line number removal logic for {edges_file.name}")
-                    # Skip the line number and parse as comma-delimited
-                    # Read all lines and remove line numbers
                     lines = f.readlines()
                     f.seek(0)
-                    # Write cleaned lines back
                     import io
+
                     cleaned_content = io.StringIO()
                     for line in lines:
                         if '|' in line and line[0].isdigit():
-                            # Remove line number prefix (e.g., "1|" -> "")
-                            cleaned_line = line[line.find('|')+1:]
+                            cleaned_line = line[line.find('|') + 1 :]
                             cleaned_content.write(cleaned_line)
                         else:
                             cleaned_content.write(line)
@@ -371,150 +504,152 @@ class NeptuneToFalkorDBConverter:
                     reader = csv.DictReader(cleaned_content)
                 elif '|' in first_line and not first_line.startswith('1|'):
                     logger.debug(f"Using pure pipe-delimited logic for {edges_file.name}")
-                    # Pure pipe-delimited (Neptune export format)
                     reader = csv.DictReader(f, delimiter='|')
                 else:
                     logger.debug(f"Using standard comma-delimited logic for {edges_file.name}")
-                    # Standard comma-delimited
                     reader = csv.DictReader(f)
-                
+
                 logger.debug(f"Headers for {edges_file.name}: {reader.fieldnames}")
-                
+
                 for row in reader:
-                    # Get source and target first (required for valid edge)
                     source = row.get('~from') or row.get('source') or row.get('from')
                     target = row.get('~to') or row.get('target') or row.get('to')
-                    
                     if not source or not target:
                         logger.warning(f"Missing source or target for edge: {row}")
                         continue
-                    
-                    # Extract edge type/label
-                    edge_type = row.get('~label') or row.get('label') or row.get('type') or row.get('relationship_type')
-                    if not edge_type:
-                        edge_type = 'UnlabeledEdge'  # Default type for edges without explicit type
-                    
+
+                    edge_type = (
+                        row.get('~label')
+                        or row.get('label')
+                        or row.get('type')
+                        or row.get('relationship_type')
+                        or 'UnlabeledEdge'
+                    )
+
+                    edge_type = str(edge_type)
                     self.edge_types.add(edge_type)
-                    
-                    # Extract properties (skip Neptune system columns)
-                    edge_properties = {}
+
+                    edge_properties: Dict[str, str] = {}
                     for col, value in row.items():
-                        if not col.startswith('~') and col not in ['id', 'label', 'type', 'source', 'target', 'from', 'to'] and value:
-                            # Strip type annotations from column names (e.g., "dist:int" -> "dist")
-                            clean_col = col.split(':')[0] if ':' in col else col
-                            self.edge_properties.add(clean_col)
-                            edge_properties[clean_col] = value
-                    
-                    # Store edge data for this type
+                        if col.startswith('~') or col in ['id', 'label', 'type', 'source', 'target', 'from', 'to']:
+                            continue
+                        if value is None or value == "":
+                            continue
+
+                        clean_col = col.split(':')[0] if ':' in col else col
+                        self.edge_properties.add(clean_col)
+                        edge_properties[clean_col] = value
+
                     if edge_type not in type_data:
                         type_data[edge_type] = []
                         type_properties[edge_type] = set()
-                    
-                    # Get source and target labels from node mapping
-                    source_labels = self.node_id_to_labels.get(source, ['Unknown'])
-                    target_labels = self.node_id_to_labels.get(target, ['Unknown'])
-                    
-                    # Use primary label (first one) for source_label and target_label
-                    source_label = source_labels[0] if source_labels else 'Unknown'
-                    target_label = target_labels[0] if target_labels else 'Unknown'
-                    
-                    edge_data = {
-                        'source': source,
-                        'target': target,
-                        'type': edge_type,
-                        'source_label': source_label,
-                        'target_label': target_label,
-                        'properties': edge_properties
-                    }
-                    type_data[edge_type].append(edge_data)
-                    
-                    # Track properties used by this edge type
+
+                    type_data[edge_type].append(
+                        {
+                            "source": str(source),
+                            "target": str(target),
+                            "properties": edge_properties,
+                        }
+                    )
                     type_properties[edge_type].update(edge_properties.keys())
-        
-        # Create separate CSV files for each edge type
-        created_files = []
-        for edge_type in sorted(self.edge_types):
-            if edge_type not in type_data:
-                logger.warning(f"Edge type '{edge_type}' found but has no associated data")
-                continue
-            
-            # Create filename safe for filesystem
-            safe_type = edge_type.replace('/', '_').replace('\\', '_').replace(':', '_').replace('*', '_').replace('?', '_').replace('"', '_').replace('<', '_').replace('>', '_').replace('|', '_')
-            edges_output = self.output_dir / f'edges_{safe_type}.csv'
-            
-            # Prepare headers specific to this edge type
-            type_specific_properties = sorted(type_properties[edge_type])
-            headers = ['source', 'target', 'type', 'source_label', 'target_label'] + type_specific_properties
-            
+
+        created_files: List[str] = []
+        self._generated_edge_files = []
+
+        for edge_type in sorted(type_data.keys()):
+            out_name = self._edgetype_filename(edge_type)
+            edges_output = self.output_dir / out_name
+
+            props = sorted(type_properties.get(edge_type, set()))
+
+            prop_types: Dict[str, str] = {}
+            if self.enforce_schema:
+                for prop in props:
+                    values: List[Any] = []
+                    for edge_data in type_data[edge_type]:
+                        raw_val = edge_data["properties"].get(prop, "")
+                        if raw_val == "":
+                            continue
+                        values.append(self.parse_neptune_property_value(raw_val))
+                    prop_types[prop] = self._infer_schema_type(values)
+
+                headers = [":START_ID", ":END_ID"] + [
+                    f"{prop}:{prop_types[prop]}" for prop in props
+                ]
+            else:
+                headers = ["source", "target"] + props
+
             with open(edges_output, 'w', newline='', encoding='utf-8') as out_f:
                 writer = csv.writer(out_f)
                 writer.writerow(headers)
-                
+
                 for edge_data in type_data[edge_type]:
-                    # Build output row
-                    output_row = [edge_data['source'], edge_data['target'], edge_data['type'], 
-                                edge_data['source_label'], edge_data['target_label']]
-                    
-                    # Add properties specific to this edge type
-                    for prop in type_specific_properties:
-                        value = edge_data['properties'].get(prop, '')
-                        if value:
-                            parsed_value = self.parse_neptune_property_value(value)
+                    output_row: List[str] = [edge_data["source"], edge_data["target"]]
+                    for prop in props:
+                        raw_val = edge_data["properties"].get(prop, "")
+                        if raw_val == "":
+                            output_row.append("")
+                            continue
+
+                        parsed_value = self.parse_neptune_property_value(raw_val)
+                        if self.enforce_schema:
+                            output_row.append(
+                                self._format_value_for_schema(parsed_value, prop_types[prop])
+                            )
+                        else:
                             if isinstance(parsed_value, (dict, list)):
                                 output_row.append(json.dumps(parsed_value))
                             else:
                                 output_row.append(str(parsed_value))
-                        else:
-                            output_row.append('')
-                    
+
                     writer.writerow(output_row)
-            
-            created_files.append(edges_output.name)
-            logger.info(f"Created {edges_output} with {len(type_data[edge_type])} edges")
-        
+
+            created_files.append(out_name)
+            edge_manifest_entry: Dict[str, Any] = {
+                "file": out_name,
+                "type": edge_type,
+                "count": len(type_data[edge_type]),
+                "properties": props,
+            }
+            if self.enforce_schema:
+                edge_manifest_entry["property_types"] = prop_types
+            self._generated_edge_files.append(edge_manifest_entry)
+
+            logger.info(f"Created {edges_output} with {len(type_data[edge_type])} edges (type={edge_type})")
+
         logger.info(f"Created {len(created_files)} edge files: {created_files}")
         logger.info(f"Found {len(self.edge_types)} unique edge types: {sorted(self.edge_types)}")
         logger.info(f"Found {len(self.edge_properties)} unique edge properties: {sorted(self.edge_properties)}")
     
-    def generate_schema_info(self) -> None:
-        """Generate a schema information file."""
-        # List generated files
-        node_files = list(self.output_dir.glob('nodes_*.csv'))
-        edge_files = list(self.output_dir.glob('edges_*.csv'))
-        
-        schema_info = {
-            'conversion_info': {
-                'source_format': 'Neptune Export Service CSV',
-                'target_format': 'FalkorDB CSV (separate files per label/type)',
-                'conversion_timestamp': str(Path().cwd()),
-                'output_structure': 'separate_files_per_type'
+    def generate_bulk_loader_manifest(self) -> Path:
+        """Write a manifest describing the generated bulk-loader CSVs."""
+        manifest = {
+            "format": "falkordb-bulk-loader",
+            "source": {
+                "source_format": "Neptune Export Service CSV",
+                "generated_at": datetime.now(timezone.utc).isoformat(),
             },
-            'files_generated': {
-                'node_files': [f.name for f in sorted(node_files)],
-                'edge_files': [f.name for f in sorted(edge_files)],
-                'total_files': len(node_files) + len(edge_files)
+            "options": {
+                "enforce_schema": self.enforce_schema,
             },
-            'nodes': {
-                'labels': sorted(self.node_labels),
-                'properties': sorted(self.node_properties),
-                'count_labels': len(self.node_labels),
-                'count_properties': len(self.node_properties),
-                'files_per_label': {label: f'nodes_{label.replace("/", "_").replace("\\", "_").replace(":", "_").replace("*", "_").replace("?", "_").replace('"', "_").replace("<", "_").replace(">", "_").replace("|", "_")}.csv' for label in sorted(self.node_labels)}
+            "output": {
+                "nodes": self._generated_node_files,
+                "relations": self._generated_edge_files,
             },
-            'edges': {
-                'types': sorted(self.edge_types),
-                'properties': sorted(self.edge_properties),
-                'count_types': len(self.edge_types),
-                'count_properties': len(self.edge_properties),
-                'files_per_type': {edge_type: f'edges_{edge_type.replace("/", "_").replace("\\", "_").replace(":", "_").replace("*", "_").replace("?", "_").replace('"', "_").replace("<", "_").replace(">", "_").replace("|", "_")}.csv' for edge_type in sorted(self.edge_types)}
-            }
+            "summary": {
+                "node_labels": sorted(self.node_labels),
+                "edge_types": sorted(self.edge_types),
+                "node_properties": sorted(self.node_properties),
+                "edge_properties": sorted(self.edge_properties),
+            },
         }
-        
-        schema_file = self.output_dir / 'schema_info.json'
-        with open(schema_file, 'w', encoding='utf-8') as f:
-            json.dump(schema_info, f, indent=2)
-        
-        logger.info(f"Schema information written to {schema_file}")
+
+        manifest_path = self.output_dir / self.MANIFEST_FILENAME
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+
+        logger.info(f"Bulk loader manifest written to {manifest_path}")
+        return manifest_path
     
     def convert(self) -> None:
         """Main conversion method."""
@@ -529,23 +664,21 @@ class NeptuneToFalkorDBConverter:
         
         logger.info(f"Found {len(files['node_files'])} node files and {len(files['edge_files'])} edge files")
         
-        # Convert nodes first to build ID-to-label mapping
+        # Convert nodes
         if files['node_files']:
             self.convert_nodes(files['node_files'])
         else:
-            logger.warning("No node files found - edge label mapping will be incomplete")
-        
-        # Convert edges (requires node mapping to be available)
+            logger.warning("No node files found")
+
+        # Convert edges
         if files['edge_files']:
-            if not self.node_id_to_labels:
-                logger.warning("No node label mapping available - source_label and target_label will show 'Unknown'")
             self.convert_edges(files['edge_files'])
         else:
             logger.warning("No edge files found")
         
-        # Generate schema info
-        self.generate_schema_info()
-        
+        # Write manifest for bulk-loader import
+        manifest_path = self.generate_bulk_loader_manifest()
+
         logger.info("Conversion completed successfully!")
         
         # Print summary
@@ -570,15 +703,24 @@ class NeptuneToFalkorDBConverter:
             print(f"    - {f.name}")
         
         print(f"\n  Metadata:")
-        print(f"    - schema_info.json")
+        print(f"    - {manifest_path.name}")
         
         
 
 def main():
-    parser = argparse.ArgumentParser(description='Convert Neptune Export Service CSV to FalkorDB format')
+    parser = argparse.ArgumentParser(
+        description='Convert Neptune Export Service CSV to FalkorDB bulk-loader CSV format'
+    )
     parser.add_argument('--input-dir', '-i', required=True, help='Directory containing Neptune export CSV files')
     parser.add_argument('--output-dir', '-o', required=True, help='Output directory for FalkorDB CSV files')
     parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
+    parser.add_argument(
+        '--enforce-schema',
+        '--enforce-scehma',
+        dest='enforce_schema',
+        action='store_true',
+        help='Emit typed CSV headers compatible with falkordb-bulk-loader --enforce-schema',
+    )
     
     args = parser.parse_args()
     
@@ -596,7 +738,9 @@ def main():
         sys.exit(1)
     
     # Create converter and run
-    converter = NeptuneToFalkorDBConverter(args.input_dir, args.output_dir)
+    converter = NeptuneToFalkorDBConverter(
+        args.input_dir, args.output_dir, enforce_schema=args.enforce_schema
+    )
     converter.convert()
 
 

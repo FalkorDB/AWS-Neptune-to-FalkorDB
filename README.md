@@ -1,6 +1,8 @@
-# AWS Neptune to FalkorDB CSV Converter
+# AWS Neptune to FalkorDB (Bulk Loader) CSV Converter
 
-This script converts Amazon Neptune Export Service CSV files into FalkorDB-compatible CSV format for easy data migration. The converter creates **separate CSV files for each node label and edge type**, optimizing the schema for each entity type.
+This script converts Amazon Neptune Export Service CSV files into **FalkorDB bulk-loader compatible** CSVs for easy data migration.
+
+It produces **separate CSV files per unique node label-set and per edge type** (plus a manifest file), so you can load the output directly with `falkordb-bulk-loader`.
 
 ## Features
 
@@ -34,6 +36,14 @@ chmod +x neptune_to_falkordb_converter.py
 python3 neptune_to_falkordb_converter.py --input-dir /path/to/neptune/export --output-dir /path/to/falkordb/output
 ```
 
+### Enforced Schema Output (optional)
+
+If you want the converter to write Neo4j-style typed headers (e.g. `id:ID`, `name:STRING`, `:START_ID`, `:END_ID`) for use with the bulk loader's `--enforce-schema` flag:
+
+```bash
+python neptune_to_falkordb_converter.py -i /path/to/neptune/export -o /path/to/falkordb/output --enforce-schema
+```
+
 ### With Verbose Logging
 
 ```bash
@@ -43,9 +53,9 @@ python3 neptune_to_falkordb_converter.py -i ./twitter_neptune_data -o ./twitter_
 ## Command Line Options
 
 ```
-usage: neptune_to_falkordb_converter.py [-h] --input-dir INPUT_DIR --output-dir OUTPUT_DIR [--verbose]
+usage: neptune_to_falkordb_converter.py [-h] --input-dir INPUT_DIR --output-dir OUTPUT_DIR [--verbose] [--enforce-schema]
 
-Convert Neptune Export Service CSV to FalkorDB format
+Convert Neptune Export Service CSV to FalkorDB bulk-loader CSV format
 
 optional arguments:
   -h, --help            show this help message and exit
@@ -54,6 +64,7 @@ optional arguments:
   --output-dir OUTPUT_DIR, -o OUTPUT_DIR
                         Output directory for FalkorDB CSV files
   --verbose, -v         Enable verbose logging for debugging
+  --enforce-schema      Emit typed CSV headers compatible with falkordb-bulk-loader --enforce-schema
 ```
 
 ## Input Format (Neptune Export Service)
@@ -74,33 +85,43 @@ e1,FOLLOWS,1,2,2023-01-15,1.0
 e2,MENTIONS,2,1,2023-02-20,0.8
 ```
 
-## Output Format (FalkorDB)
+## Output Format (FalkorDB Bulk Loader)
 
-The script generates **separate FalkorDB-compatible CSV files for each node label and edge type**:
+The script generates CSVs in the **falkordb-bulk-loader** schemaless format by default.
 
-### Node Files (nodes_[LABEL].csv)
-Each node label gets its own optimized file:
+If you run the converter with `--enforce-schema`, the CSV headers will include explicit types and ID markers compatible with `falkordb-bulk-loader --enforce-schema`.
+
+### Node Files (nodes_*.csv)
+Each output node file represents a label-set. The **first column is the node identifier**, and the remaining columns are node properties.
 
 **nodes_User.csv**:
 ```csv
-id,labels,username,followers_count,verified
-1,User,@elonmusk,50000000,true
-2,User,@twitter,60000000,true
+id,username,followers_count,verified
+1,@elonmusk,50000000,true
+2,@twitter,60000000,true
 ```
 
-### Edge Files (edges_[TYPE].csv)
-Each edge type gets its own optimized file:
+If Neptune vertices contain multiple labels, nodes are grouped by their *full label set* and written once to a combined file. Example:
+
+**nodes_User__Verified.csv** (labels `User:Verified` at import time):
+```csv
+id,username,verified
+42,@example,true
+```
+
+### Edge Files (edges_*.csv)
+Each output edge file represents a relationship type. The **first two columns are the start and end node identifiers**, and the remaining columns are relationship properties.
 
 **edges_FOLLOWS.csv**:
 ```csv
-source,target,type,source_label,target_label,created_at,weight
-1,2,FOLLOWS,User,User,2023-01-15,1.0
+source,target,created_at,weight
+1,2,2023-01-15,1.0
 ```
 
 **edges_MENTIONS.csv**:
 ```csv
-source,target,type,source_label,target_label,created_at,weight
-2,1,MENTIONS,User,User,2023-02-20,0.8
+source,target,created_at,weight
+2,1,2023-02-20,0.8
 ```
 
 ## File Discovery
@@ -143,20 +164,18 @@ The script intelligently converts Neptune data types:
 The converter creates **multiple optimized files**:
 
 ### Node Files
-- **`nodes_[LABEL].csv`**: One file per node label with only relevant properties
-- Example: `nodes_User.csv`, `nodes_Tweet.csv`, `nodes_Hashtag.csv`
+- **`nodes_*.csv`**: One file per **unique label-set** (a node appears in exactly one file)
+- Example: `nodes_User.csv`, `nodes_Tweet.csv`, `nodes_User__Verified.csv`
 
 ### Edge Files
-- **`edges_[TYPE].csv`**: One file per edge type with only relevant properties
-- Includes `source_label` and `target_label` columns for context
+- **`edges_*.csv`**: One file per edge type with only relevant properties
 - Example: `edges_FOLLOWS.csv`, `edges_MENTIONS.csv`, `edges_RETWEETS.csv`
 
 ### Metadata
-- **`schema_info.json`**: Comprehensive schema information including:
-  - Node labels and their corresponding files
-  - Edge types and their corresponding files
-  - Property lists per label/type
-  - File mapping and conversion metadata
+- **`bulk_loader_manifest.json`**: Manifest describing the generated CSVs, including:
+  - Node files and the label-set that should be applied to each file
+  - Relationship files and their relationship type
+  - Basic summary information
 
 ## Example Workflow
 
@@ -168,20 +187,18 @@ The converter creates **multiple optimized files**:
 3. **Review the output**:
    ```bash
    ls twitter_falkordb_import/
-   # nodes_User.csv  nodes_Tweet.csv  edges_FOLLOWS.csv  edges_MENTIONS.csv  schema_info.json
-   
+   # nodes_*.csv  edges_*.csv  bulk_loader_manifest.json
+
    # Check node files
    head twitter_falkordb_import/nodes_User.csv
-   head twitter_falkordb_import/nodes_Tweet.csv
-   
+
    # Check edge files
    head twitter_falkordb_import/edges_FOLLOWS.csv
-   head twitter_falkordb_import/edges_MENTIONS.csv
-   
-   # Review schema
-   cat twitter_falkordb_import/schema_info.json
+
+   # Review manifest
+   cat twitter_falkordb_import/bulk_loader_manifest.json
    ```
-4. **Import into FalkorDB** using the FalkorDB Rust loader (see [Loading Data into FalkorDB](#loading-data-into-falkordb) section below)
+4. **Import into FalkorDB** using `falkordb-bulk-loader` (see [Loading Data into FalkorDB](#loading-data-into-falkordb) below)
 
 ## Real Example: Twitter Dataset
 
@@ -196,14 +213,14 @@ python3 neptune_to_falkordb_converter.py -i ./twitter_neptune_export -o ./twitte
 # Converting edges from 1 files: ['follows.csv']
 # 
 # Created files:
-# nodes_User.csv     - Twitter user profiles with properties
-# edges_FOLLOWS.csv  - Follow relationships with timestamps
-# schema_info.json   - Complete schema metadata
+# nodes_User.csv                - Twitter user profiles with properties
+# edges_FOLLOWS.csv             - Follow relationships with timestamps
+# bulk_loader_manifest.json     - Bulk loader manifest
 ```
 
 **Sample Output Structure:**
-- **nodes_User.csv**: `id,labels,username,followers_count,verified`
-- **edges_FOLLOWS.csv**: `source,target,type,source_label,target_label,created_at`
+- **nodes_User.csv**: `id,username,followers_count,verified`
+- **edges_FOLLOWS.csv**: `source,target,created_at`
 
 ## Troubleshooting
 
@@ -231,63 +248,43 @@ python3 neptune_to_falkordb_converter.py -i input -o output --verbose
 
 ## Loading Data into FalkorDB
 
-After converting your Neptune data to CSV format using this tool, you can load it into FalkorDB using the high-performance **FalkorDB Rust Loader**.
+After converting your Neptune data, you can load it into FalkorDB using the **FalkorDB bulk loader**.
 
-### FalkorDB Rust Loader
+### Prerequisite: falkordb-bulk-loader
 
-The [FalkorDB Rust Loader](https://github.com/FalkorDB/FalkorDB-Loader-RS) is a command-line tool specifically designed for loading CSV files into FalkorDB with optimal performance and comprehensive error handling.
-
-#### Installation
+Clone the bulk loader next to this repository (or point to it with `--bulk-loader-dir`):
 
 ```bash
-git clone https://github.com/FalkorDB/FalkorDB-Loader-RS
-cd FalkorDB-Loader-RS
-cargo build --release
+git clone https://github.com/falkordb/falkordb-bulk-loader.git ../falkordb-bulk-loader
 ```
 
-#### Basic Usage
+### Option A (recommended): use the helper script in this repo
 
 ```bash
-# Load your converted CSV files into FalkorDB
-./target/release/falkordb-loader my_graph_name --csv-dir ./twitter_falkordb_import
+# Convert
+python3 neptune_to_falkordb_converter.py -i ./neptune_export -o ./falkordb_csv
+
+# (Optional) generate typed headers for strict loading
+# python3 neptune_to_falkordb_converter.py -i ./neptune_export -o ./falkordb_csv --enforce-schema
+
+# Load (invokes ../falkordb-bulk-loader/falkordb_bulk_loader/bulk_insert.py)
+# If the manifest indicates enforce_schema=true, the helper will automatically pass --enforce-schema.
+python3 bulk_load_to_falkordb.py my_graph_name --csv-dir ./falkordb_csv --server-url redis://127.0.0.1:6379
 ```
 
-#### Advanced Usage
+### Option B: call bulk_insert.py directly
+
+The converter writes `bulk_loader_manifest.json` which tells you which `-N` (nodes-with-label) and `-R` (relations-with-type) arguments to pass.
 
 ```bash
-# Load with custom settings
-./target/release/falkordb-loader my_graph_name \
-  --host localhost \
-  --port 6379 \
-  --csv-dir ./twitter_falkordb_import \
-  --batch-size 1000 \
-  --merge-mode \
-  --stats \
-  --progress-interval 500
+python3 ../falkordb-bulk-loader/falkordb_bulk_loader/bulk_insert.py my_graph_name \
+  -u redis://127.0.0.1:6379 \
+  -N User ./falkordb_csv/nodes_User.csv \
+  -R FOLLOWS ./falkordb_csv/edges_FOLLOWS.csv
+
+# If you converted with --enforce-schema, add:
+#   --enforce-schema
 ```
-
-#### Key Features
-
-- **High Performance**: Async batch processing with configurable batch sizes
-- **Schema Management**: Automatic index and constraint creation
-- **Merge Mode**: Support for upsert operations to handle duplicate data
-- **Progress Tracking**: Real-time progress reporting during loading
-- **Error Handling**: Comprehensive error handling with detailed logging
-- **Type Safety**: Automatic type inference for properties
-
-#### Workflow Integration
-
-1. **Convert Neptune data** using this Neptune-to-FalkorDB converter
-2. **Load into FalkorDB** using the Rust loader:
-   ```bash
-   # Convert
-   python3 neptune_to_falkordb_converter.py -i ./neptune_export -o ./falkordb_csv
-   
-   # Load
-   ./target/release/falkordb-loader my_social_graph --csv-dir ./falkordb_csv --stats
-   ```
-
-For detailed usage instructions and configuration options, visit the [FalkorDB Rust Loader repository](https://github.com/FalkorDB/FalkorDB-Loader-RS).
 
 ## Advanced Features
 
@@ -298,14 +295,13 @@ The converter automatically handles multiple CSV formats:
 - **Line-numbered format**: Files with line number prefixes (e.g., `1|data,data,data`)
 
 ### File Organization
-- **Label-based optimization**: Each node label gets a file with only its relevant properties
+- **Label-set-based optimization**: Each unique node label-set gets a file with only its relevant properties
 - **Type-based optimization**: Each edge type gets a file with only its relevant properties
 - **Safe filename generation**: Special characters in labels/types are safely converted
 
 ### Multi-label Support
-- Nodes can have multiple labels (stored as semicolon-separated values)
-- Primary label used for source_label/target_label in edges
-- All labels preserved in the `labels` column
+- Nodes with multiple labels are grouped into a combined node file (e.g., `nodes_User__Verified.csv`)
+- At load time, the bulk loader is invoked with `-N User:Verified nodes_User__Verified.csv` to apply both labels
 
 ## License
 
