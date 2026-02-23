@@ -15,9 +15,10 @@ It produces **separate CSV files per unique node label-set and per edge type** (
 - **Schema documentation**: Generates detailed schema information about the converted data
 
 ## Requirements
-
 - Python 3.7+
-- Standard library modules only (no external dependencies)
+- Converter script (`neptune_to_falkordb_converter.py`): standard library modules only (no external dependencies)
+- Loader helper (`bulk_load_to_falkordb.py`): standard library only unless you enable index creation
+  - Optional (only if using `--create-id-indexes`): `pip install falkordb redis`
 
 ## Installation
 
@@ -270,6 +271,11 @@ python3 neptune_to_falkordb_converter.py -i ./neptune_export -o ./falkordb_csv
 # Load (invokes ../falkordb-bulk-loader/falkordb_bulk_loader/bulk_insert.py)
 # If the manifest indicates enforce_schema=true, the helper will automatically pass --enforce-schema.
 python3 bulk_load_to_falkordb.py my_graph_name --csv-dir ./falkordb_csv --server-url redis://127.0.0.1:6379
+
+# Optional: create :<Label>(id) range indexes after load (requires: pip install falkordb redis)
+#   --create-id-indexes
+# Optional: if your ID property is not named 'id'
+#   --id-property <property_name>
 ```
 
 ### Option B: call bulk_insert.py directly

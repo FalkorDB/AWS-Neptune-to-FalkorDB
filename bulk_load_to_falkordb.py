@@ -24,7 +24,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterable, List, Set
 
 
 def _load_manifest(csv_dir: Path) -> Dict[str, Any]:
@@ -33,6 +33,80 @@ def _load_manifest(csv_dir: Path) -> Dict[str, Any]:
         raise FileNotFoundError(f"Manifest not found: {manifest_path}")
     with open(manifest_path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _iter_node_labels_from_manifest(manifest: Dict[str, Any]) -> Iterable[str]:
+    # Preferred: the converter writes a summary list of all labels.
+    labels = manifest.get("summary", {}).get("node_labels")
+    if isinstance(labels, list) and labels:
+        for l in labels:
+            if isinstance(l, str) and l:
+                yield l
+        return
+
+    # Fallback: collect labels from each node file entry.
+    seen: Set[str] = set()
+    nodes = manifest.get("output", {}).get("nodes", [])
+    for n in nodes:
+        for l in n.get("labels", []) or []:
+            if isinstance(l, str) and l and l not in seen:
+                seen.add(l)
+                yield l
+
+
+def _cypher_quote_identifier(name: str) -> str:
+    # Backtick quoting for labels/properties (escape any backticks by doubling them).
+    return "`" + name.replace("`", "``") + "`"
+
+
+def _create_node_id_indexes(
+    *,
+    graph_name: str,
+    server_url: str,
+    labels: List[str],
+    id_property: str,
+) -> None:
+    # Import lazily so the wrapper can still be used in --dry-run mode without deps.
+    try:
+        from redis.exceptions import ResponseError
+        from falkordb import FalkorDB
+    except ModuleNotFoundError as e:
+        raise RuntimeError(
+            "Index creation requires the Python packages 'falkordb' and 'redis'. "
+            "Install them (e.g. pip install falkordb redis) or re-run without --create-id-indexes."
+        ) from e
+
+    if not labels:
+        return
+
+    client = FalkorDB.from_url(server_url)
+    graph = client.select_graph(graph_name)
+
+    print(f"Creating node ID indexes on property '{id_property}' for {len(labels)} label(s)...")
+
+    # Creating an already-existing index raises a ResponseError; treat that as success.
+    for label in labels:
+        q = (
+            f"CREATE INDEX FOR (n:{_cypher_quote_identifier(label)}) "
+            f"ON (n.{_cypher_quote_identifier(id_property)})"
+        )
+        try:
+            graph.query(q)
+            print(f"  created :{label}({id_property})")
+        except ResponseError as e:
+            msg = str(e).lower()
+            if any(
+                s in msg
+                for s in (
+                    "already exists",
+                    "equivalent index already exists",
+                    "already indexed",
+                    "index exists",
+                )
+            ):
+                print(f"  exists  :{label}({id_property})")
+                continue
+            raise
 
 
 def main() -> None:
@@ -60,6 +134,19 @@ def main() -> None:
         "--dry-run",
         action="store_true",
         help="Print the bulk loader command without executing it",
+    )
+    parser.add_argument(
+        "--create-id-indexes",
+        action="store_true",
+        help=(
+            "Create node range indexes on the ID property after load. "
+            "This requires the optional Python packages 'falkordb' and 'redis'."
+        ),
+    )
+    parser.add_argument(
+        "--id-property",
+        default="id",
+        help="Node property name to index per label (default: id)",
     )
     parser.add_argument(
         "--enforce-schema",
@@ -129,6 +216,15 @@ def main() -> None:
         return
 
     subprocess.run(cmd, check=True)
+
+    if args.create_id_indexes:
+        labels = sorted(set(_iter_node_labels_from_manifest(manifest)))
+        _create_node_id_indexes(
+            graph_name=args.graph,
+            server_url=args.server_url,
+            labels=labels,
+            id_property=args.id_property,
+        )
 
 
 if __name__ == "__main__":
