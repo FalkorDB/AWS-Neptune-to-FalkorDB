@@ -13,6 +13,7 @@ It produces **separate CSV files per unique node label-set and per edge type** (
 - **Flexible input formats**: Handles various Neptune export CSV formats including pipe-delimited and line-numbered formats
 - **Smart delimiter detection**: Automatically detects CSV delimiters and line number prefixes
 - **Schema documentation**: Generates detailed schema information about the converted data
+- **Flexible loading helper**: `bulk_load_to_falkordb.py` supports both insert mode (new graph) and update mode (existing graph)
 
 ## Requirements
 - Python 3.7+
@@ -28,6 +29,7 @@ No installation required. Just download the script:
 # Make the script executable
 chmod +x neptune_to_falkordb_converter.py
 ```
+
 
 ## Usage
 
@@ -128,12 +130,10 @@ source,target,created_at,weight
 ## File Discovery
 
 The script automatically detects Neptune export files using these patterns:
+**Node files**: any CSV filename containing `vertices`, `nodes`, or `vertex`  
+**Edge files**: any CSV filename containing `edges` or `relationships`
 
-**Node files**: `vertices.csv`, `nodes.csv`, `vertex.csv`
-**Edge files**: `edges.csv`, `relationships.csv`, `edge.csv`
-**Schema files**: `schema.json`, `metadata.json`
-
-If standard file names aren't found, the script analyzes CSV headers to identify file types.
+For remaining unmatched CSV files, the script analyzes CSV headers to identify file types.
 
 ## Neptune Column Mapping
 
@@ -272,11 +272,30 @@ python3 neptune_to_falkordb_converter.py -i ./neptune_export -o ./falkordb_csv
 # If the manifest indicates enforce_schema=true, the helper will automatically pass --enforce-schema.
 python3 bulk_load_to_falkordb.py my_graph_name --csv-dir ./falkordb_csv --server-url redis://127.0.0.1:6379
 
+# Update mode (invokes bulk_update.py with auto-generated Cypher per CSV file)
+# Useful when updating an existing graph.
+python3 bulk_load_to_falkordb.py my_graph_name --csv-dir ./falkordb_csv --mode update --server-url redis://127.0.0.1:6379
+
 # Optional: create :<Label>(id) range indexes after load (requires: pip install falkordb redis)
 #   --create-id-indexes
 # Optional: if your ID property is not named 'id'
-#   --id-property <property_name>
+#   --id-property <property_name>   (also used by --mode update to match source/target nodes)
 ```
+
+#### `bulk_load_to_falkordb.py` key options
+
+- `--mode insert|update` (default: `insert`)
+  - `insert`: builds a new graph via `bulk_insert.py` and `-N/-R` manifest mappings
+  - `update`: runs `bulk_update.py` per generated CSV using auto-generated Cypher upserts
+- `--enforce-schema` / `--no-enforce-schema`
+  - Applies to `insert` mode only (passed through to `bulk_insert.py`)
+- `--id-property <name>`
+  - Property used for post-load index creation, and in `update` mode for endpoint matching
+- `--dry-run`
+  - Prints the command(s) that would run
+
+In `update` mode, this wrapper auto-generates `--csv` / `--query` for each file.  
+Do not pass `--csv`, `--query`, or `--variable-name` through passthrough args.
 
 ### Option B: call bulk_insert.py directly
 
