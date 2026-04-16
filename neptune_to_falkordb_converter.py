@@ -93,73 +93,65 @@ class NeptuneToFalkorDBConverter:
         Neptune export format creates separate CSV files for different node types and edge types.
         """
         files = {'node_files': [], 'edge_files': []}
-        
-        # First, look for standard Neptune export patterns
-        standard_patterns = {
-            'vertices': ['vertices.csv', 'nodes.csv', 'vertex.csv'],
-            'edges': ['edges.csv', 'relationships.csv', 'edge.csv'],
-            'schema': ['schema.json', 'metadata.json']
-        }
-        
-        standard_files = {}
-        for file_type, pattern_list in standard_patterns.items():
-            for pattern in pattern_list:
-                file_path = self.input_dir / pattern
-                if file_path.exists():
-                    standard_files[file_type] = file_path
-                    break
-        
-        # If we found standard format, use it
-        if standard_files.get('vertices'):
-            files['node_files'] = [standard_files['vertices']]
-        if standard_files.get('edges'):
-            files['edge_files'] = [standard_files['edges']]
-        
-        # If no standard files, look for Neptune CSV export format (separate files)
-        if not files['node_files'] and not files['edge_files']:
-            csv_files = list(self.input_dir.glob('*.csv'))
-            logger.info(f"Found CSV files: {[f.name for f in csv_files]}")
-            
-            # Classify files based on filename patterns and headers
-            for csv_file in csv_files:
-                try:
-                    with open(csv_file, 'r', encoding='utf-8') as f:
-                        # Handle pipe-delimited files (Neptune export format)
-                        first_line = f.readline().strip()
-                        
-                        # Try pipe delimiter first (Neptune export format)
-                        if '|' in first_line:
-                            headers = [h.strip('"') for h in first_line.split('|')]
-                        else:
-                            # Fall back to comma delimiter
-                            f.seek(0)
-                            headers = next(csv.reader(f))
-                        
-                        # Determine if it's a node file or edge file
-                        filename = csv_file.name.lower()
-                        
-                        # Edge file patterns
-                        if ('edge' in filename or '_edges' in filename or 
-                            'relationship' in filename or 'follows' in filename or 
-                            'likes' in filename or 'mentions' in filename or 
-                            'retweets' in filename or 'tweets' in filename):
-                            
-                            # Verify it has edge-like structure (~from, ~to, or source, target)
-                            if (any(h in ['~from', '~to', 'source', 'target', 'from', 'to'] for h in headers) or
-                                any('from' in h.lower() or 'to' in h.lower() for h in headers)):
-                                files['edge_files'].append(csv_file)
-                                logger.debug(f"Classified {csv_file.name} as edge file (headers: {headers[:5]})")
-                            else:
-                                logger.debug(f"File {csv_file.name} looks like edge file but missing edge headers")
-                        
-                        # Node file patterns (anything that's not clearly an edge file)
-                        elif (any(h in ['~id', 'id', 'vertex_id'] for h in headers) and
-                              not any(h in ['~from', '~to', 'source', 'target', 'from', 'to'] for h in headers)):
-                            files['node_files'].append(csv_file)
-                            logger.debug(f"Classified {csv_file.name} as node file (headers: {headers[:5]})")
-                            
-                except Exception as e:
-                    logger.warning(f"Could not read headers from {csv_file}: {e}")
+        csv_files = list(self.input_dir.glob('*.csv'))
+        logger.info(f"Found CSV files: {[f.name for f in csv_files]}")
+
+        node_name_substrings = ('vertices', 'nodes', 'vertex')
+        edge_name_substrings = ('edges', 'relationships')
+
+        classified_files: Set[Path] = set()
+
+        # First pass: classify by filename substrings.
+        # Requested behavior:
+        # - node files contain one of: vertices, nodes, vertex
+        # - edge files contain one of: edges, relationships
+        for csv_file in csv_files:
+            filename = csv_file.name.lower()
+            if any(token in filename for token in edge_name_substrings):
+                files['edge_files'].append(csv_file)
+                classified_files.add(csv_file)
+                logger.debug(f"Classified {csv_file.name} as edge file (filename substring match)")
+            elif any(token in filename for token in node_name_substrings):
+                files['node_files'].append(csv_file)
+                classified_files.add(csv_file)
+                logger.debug(f"Classified {csv_file.name} as node file (filename substring match)")
+
+        # Second pass: classify any remaining CSVs by headers.
+        for csv_file in csv_files:
+            if csv_file in classified_files:
+                continue
+
+            try:
+                with open(csv_file, 'r', encoding='utf-8') as f:
+                    # Handle pipe-delimited files (Neptune export format)
+                    first_line = f.readline().strip()
+
+                    # Try pipe delimiter first (Neptune export format)
+                    if '|' in first_line:
+                        headers = [h.strip('"') for h in first_line.split('|')]
+                    else:
+                        # Fall back to comma delimiter
+                        f.seek(0)
+                        headers = next(csv.reader(f))
+
+                    # Verify edge-like structure (~from, ~to, or source, target)
+                    if (
+                        any(h in ['~from', '~to', 'source', 'target', 'from', 'to'] for h in headers)
+                        or any('from' in h.lower() or 'to' in h.lower() for h in headers)
+                    ):
+                        files['edge_files'].append(csv_file)
+                        classified_files.add(csv_file)
+                        logger.debug(f"Classified {csv_file.name} as edge file (headers: {headers[:5]})")
+                    elif (
+                        any(h in ['~id', 'id', 'vertex_id'] for h in headers)
+                        and not any(h in ['~from', '~to', 'source', 'target', 'from', 'to'] for h in headers)
+                    ):
+                        files['node_files'].append(csv_file)
+                        classified_files.add(csv_file)
+                        logger.debug(f"Classified {csv_file.name} as node file (headers: {headers[:5]})")
+
+            except Exception as e:
+                logger.warning(f"Could not read headers from {csv_file}: {e}")
         
         logger.info(f"Found {len(files['node_files'])} node files: {[f.name for f in files['node_files']]}")
         logger.info(f"Found {len(files['edge_files'])} edge files: {[f.name for f in files['edge_files']]}")
