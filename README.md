@@ -276,6 +276,11 @@ python3 bulk_load_to_falkordb.py my_graph_name --csv-dir ./falkordb_csv --server
 # Useful when updating an existing graph.
 python3 bulk_load_to_falkordb.py my_graph_name --csv-dir ./falkordb_csv --mode update --server-url redis://127.0.0.1:6379
 
+# Update mode with a custom Cypher query body (applied per update CSV command)
+python3 bulk_load_to_falkordb.py my_graph_name --csv-dir ./falkordb_csv --mode update \
+  --update-query "MERGE (n:Device {id: row[0]}) SET n.name = row[1], n.status = row[2]" \
+  --server-url redis://127.0.0.1:6379
+
 # Optional: create :<Label>(id) range indexes after load (requires: pip install falkordb redis)
 #   --create-id-indexes
 # Optional: if your ID property is not named 'id'
@@ -291,6 +296,8 @@ python3 bulk_load_to_falkordb.py my_graph_name --csv-dir ./falkordb_csv --mode u
   - Applies to `insert` mode only (passed through to `bulk_insert.py`)
 - `--id-property <name>`
   - Property used for post-load index creation, and in `update` mode for endpoint matching
+- `--update-query "<cypher query body>"` (alias: `--merge-query`)
+  - Applies to `update` mode and overrides auto-generated Cypher
 - `--dry-run`
   - Prints the command(s) that would run
 
