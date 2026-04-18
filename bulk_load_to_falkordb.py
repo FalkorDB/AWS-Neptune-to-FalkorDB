@@ -244,6 +244,18 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--update-query",
+        "--merge-query",
+        dest="update_query",
+        default=None,
+        help=(
+            "Custom Cypher query body for --mode update. "
+            "The query should reference row values as row[index]. "
+            "Example: \"MERGE (n:Device {id: row[0]}) SET n.name = row[1]\". "
+            "If provided, it overrides the wrapper's auto-generated update query."
+        ),
+    )
+    parser.add_argument(
         "--create-id-indexes",
         action="store_true",
         help=(
@@ -272,6 +284,8 @@ def main() -> None:
     )
 
     args, passthrough = parser.parse_known_args()
+    if args.update_query and args.mode != "update":
+        parser.error("--update-query/--merge-query can only be used with --mode update")
 
     csv_dir = Path(args.csv_dir)
     manifest = _load_manifest(csv_dir)
@@ -329,7 +343,8 @@ def main() -> None:
         forbidden_seen = sorted(arg for arg in passthrough if arg in forbidden_update_passthrough)
         if forbidden_seen:
             raise RuntimeError(
-                "In --mode update, this wrapper auto-generates --csv/--query for each file. "
+                "In --mode update, this wrapper manages --csv/--query/--variable-name per file. "
+                "Use --update-query (or --merge-query) for a custom Cypher query. "
                 f"Do not pass these arguments via passthrough: {', '.join(forbidden_seen)}"
             )
 
@@ -342,7 +357,7 @@ def main() -> None:
             file_path = str(csv_dir / file_name)
             properties = list(n.get("properties", []) or [])
             property_types = dict(n.get("property_types", {}) or {})
-            query = _build_node_update_query(
+            query = args.update_query or _build_node_update_query(
                 labels=list(labels),
                 id_property=args.id_property,
                 properties=properties,
@@ -371,7 +386,7 @@ def main() -> None:
             file_path = str(csv_dir / file_name)
             properties = list(r.get("properties", []) or [])
             property_types = dict(r.get("property_types", {}) or {})
-            query = _build_relation_update_query(
+            query = args.update_query or _build_relation_update_query(
                 relation_type=str(rel_type),
                 id_property=args.id_property,
                 properties=properties,
