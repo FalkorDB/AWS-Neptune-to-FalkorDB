@@ -280,6 +280,13 @@ python3 bulk_load_to_falkordb.py my_graph_name --csv-dir ./falkordb_csv --mode u
 python3 bulk_load_to_falkordb.py my_graph_name --csv-dir ./falkordb_csv --mode update \
   --update-query "MERGE (n:Device {id: row[0]}) SET n.name = row[1], n.status = row[2]" \
   --server-url redis://127.0.0.1:6379
+# Update mode with per-file Cypher query bodies from CSV
+# CSV format:
+#   column 1 = input file name (e.g. nodes_User.csv or edges_FOLLOWS.csv)
+#   column 2 = MERGE/Cypher query body
+python3 bulk_load_to_falkordb.py my_graph_name --csv-dir ./falkordb_csv --mode update \
+  --update-queries-csv ./update_queries.csv \
+  --server-url redis://127.0.0.1:6379
 
 # Optional: create :<Label>(id) range indexes after load (requires: pip install falkordb redis)
 #   --create-id-indexes
@@ -297,7 +304,10 @@ python3 bulk_load_to_falkordb.py my_graph_name --csv-dir ./falkordb_csv --mode u
 - `--id-property <name>`
   - Property used for post-load index creation, and in `update` mode for endpoint matching
 - `--update-query "<cypher query body>"` (alias: `--merge-query`)
-  - Applies to `update` mode and overrides auto-generated Cypher
+  - Applies to `update` mode as a global query fallback for all files
+- `--update-queries-csv <path>`
+  - Applies to `update` mode and maps individual files to query bodies (column 1 = file name, column 2 = query)
+  - Takes precedence over `--update-query` for matched files
 - `--dry-run`
   - Prints the command(s) that would run
 

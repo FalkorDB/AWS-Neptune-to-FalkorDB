@@ -9,6 +9,7 @@ that contains:
 It can run in one of two modes:
 - insert (default): invokes bulk_insert.py with the correct -N / -R arguments.
 - update: invokes bulk_update.py for each generated CSV using auto-generated Cypher.
+  You can also provide per-file Cypher using --update-queries-csv.
 
 Example:
   python3 bulk_load_to_falkordb.py MYGRAPH --csv-dir ./out --server-url redis://127.0.0.1:6379
@@ -21,12 +22,13 @@ Pass-through arguments:
 """
 
 import argparse
+import csv
 import json
 import shlex
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Set
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 
 def _load_manifest(csv_dir: Path) -> Dict[str, Any]:
@@ -62,6 +64,70 @@ def _cypher_quote_identifier(name: str) -> str:
 
 def _format_cmd_for_print(cmd: List[str]) -> str:
     return " ".join(shlex.quote(part) for part in cmd)
+
+def _get_command_arg_value(cmd: List[str], *arg_names: str) -> Optional[str]:
+    for i, part in enumerate(cmd):
+        if part in arg_names and i + 1 < len(cmd):
+            return cmd[i + 1]
+    return None
+
+
+def _load_update_queries_csv(path: Path) -> Dict[str, str]:
+    if not path.exists():
+        raise FileNotFoundError(f"Update queries CSV not found: {path}")
+
+    update_queries: Dict[str, str] = {}
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.reader(f)
+        for line_number, row in enumerate(reader, start=1):
+            if not row or all(not str(col).strip() for col in row):
+                continue
+
+            file_name = str(row[0]).strip()
+            query = ",".join(str(col) for col in row[1:]).strip()
+            if (
+                line_number == 1
+                and file_name.lower() in {"file", "file_name", "filename", "input_file", "input_filename"}
+                and query.lower() in {"query", "merge_query", "cypher_query", "cypher", "merge"}
+            ):
+                continue
+
+            if not file_name:
+                raise RuntimeError(
+                    f"Invalid update queries CSV row at line {line_number}: missing input file name in column 1"
+                )
+            if not query:
+                raise RuntimeError(
+                    f"Invalid update queries CSV row at line {line_number}: missing Cypher query in column 2"
+                )
+            if file_name in update_queries:
+                raise RuntimeError(
+                    f"Duplicate input file entry in update queries CSV at line {line_number}: {file_name}"
+                )
+            update_queries[file_name] = query
+
+    if not update_queries:
+        raise RuntimeError(f"Update queries CSV has no usable mappings: {path}")
+
+    return update_queries
+
+
+def _resolve_custom_update_query(
+    *, file_name: str, update_queries: Dict[str, str], used_update_query_keys: Set[str]
+) -> Optional[str]:
+    if not update_queries:
+        return None
+
+    if file_name in update_queries:
+        used_update_query_keys.add(file_name)
+        return update_queries[file_name]
+
+    base_name = Path(file_name).name
+    if base_name in update_queries:
+        used_update_query_keys.add(base_name)
+        return update_queries[base_name]
+
+    return None
 
 
 def _build_property_set_clauses(
@@ -256,6 +322,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--update-queries-csv",
+        default=None,
+        help=(
+            "CSV file for --mode update with per-file query overrides. "
+            "Column 1: input file name. Column 2: MERGE/Cypher query body. "
+            "Mappings here take precedence over --update-query."
+        ),
+    )
+    parser.add_argument(
         "--create-id-indexes",
         action="store_true",
         help=(
@@ -286,9 +361,15 @@ def main() -> None:
     args, passthrough = parser.parse_known_args()
     if args.update_query and args.mode != "update":
         parser.error("--update-query/--merge-query can only be used with --mode update")
+    if args.update_queries_csv and args.mode != "update":
+        parser.error("--update-queries-csv can only be used with --mode update")
 
     csv_dir = Path(args.csv_dir)
     manifest = _load_manifest(csv_dir)
+    update_queries = (
+        _load_update_queries_csv(Path(args.update_queries_csv)) if args.update_queries_csv else {}
+    )
+    used_update_query_keys: Set[str] = set()
 
     bulk_loader_dir = Path(args.bulk_loader_dir)
     loader_script = "bulk_insert.py" if args.mode == "insert" else "bulk_update.py"
@@ -357,7 +438,11 @@ def main() -> None:
             file_path = str(csv_dir / file_name)
             properties = list(n.get("properties", []) or [])
             property_types = dict(n.get("property_types", {}) or {})
-            query = args.update_query or _build_node_update_query(
+            query = _resolve_custom_update_query(
+                file_name=file_name,
+                update_queries=update_queries,
+                used_update_query_keys=used_update_query_keys,
+            ) or args.update_query or _build_node_update_query(
                 labels=list(labels),
                 id_property=args.id_property,
                 properties=properties,
@@ -377,6 +462,7 @@ def main() -> None:
             cmd.extend(passthrough)
             commands.append(cmd)
 
+
         for r in relations:
             rel_type = r.get("type")
             file_name = r.get("file")
@@ -386,7 +472,11 @@ def main() -> None:
             file_path = str(csv_dir / file_name)
             properties = list(r.get("properties", []) or [])
             property_types = dict(r.get("property_types", {}) or {})
-            query = args.update_query or _build_relation_update_query(
+            query = _resolve_custom_update_query(
+                file_name=file_name,
+                update_queries=update_queries,
+                used_update_query_keys=used_update_query_keys,
+            ) or args.update_query or _build_relation_update_query(
                 relation_type=str(rel_type),
                 id_property=args.id_property,
                 properties=properties,
@@ -406,11 +496,38 @@ def main() -> None:
             cmd.extend(passthrough)
             commands.append(cmd)
 
+    if args.mode == "update" and update_queries:
+        unused_update_query_keys = sorted(set(update_queries.keys()) - used_update_query_keys)
+        if unused_update_query_keys:
+            raise RuntimeError(
+                "Some entries in --update-queries-csv did not match any manifest node/relation file: "
+                + ", ".join(unused_update_query_keys)
+            )
+
     if args.dry_run:
         for cmd in commands:
             print(_format_cmd_for_print(cmd))
         return
+    if args.mode == "insert":
+        total_input_files = len(nodes) + len(relations)
+        if total_input_files > 0:
+            print(f"Loading {total_input_files} input file(s) in insert mode:")
+            file_index = 1
+            for n in nodes:
+                file_name = n.get("file")
+                print(f"  [{file_index}/{total_input_files}] loading node file: {file_name}")
+                file_index += 1
+            for r in relations:
+                file_name = r.get("file")
+                print(f"  [{file_index}/{total_input_files}] loading edge file: {file_name}")
+                file_index += 1
 
+    total_commands = len(commands)
+    for command_index, cmd in enumerate(commands, start=1):
+        if args.mode == "update" and total_commands > 1:
+            csv_path = _get_command_arg_value(cmd, "-c", "--csv")
+            csv_display = Path(csv_path).name if csv_path else "<unknown>"
+            print(f"[{command_index}/{total_commands}] loading input file: {csv_display}")
     for cmd in commands:
         subprocess.run(cmd, check=True)
 
