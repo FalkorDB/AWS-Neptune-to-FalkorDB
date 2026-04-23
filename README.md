@@ -199,7 +199,30 @@ The converter creates **multiple optimized files**:
    # Review manifest
    cat twitter_falkordb_import/bulk_loader_manifest.json
    ```
-4. **Import into FalkorDB** using `falkordb-bulk-loader` (see [Loading Data into FalkorDB](#loading-data-into-falkordb) below)
+4. **Pre-create `id` indexes for all node labels** (recommended for large datasets):
+   ```bash
+   python3 - <<'PY' | redis-cli -u redis://127.0.0.1:6379 --raw
+   import json
+   from pathlib import Path
+
+   manifest = json.loads(Path("./twitter_falkordb_import/bulk_loader_manifest.json").read_text(encoding="utf-8"))
+   labels = set(manifest.get("summary", {}).get("node_labels", []) or [])
+   if not labels:
+       for node in manifest.get("output", {}).get("nodes", []):
+           labels.update(node.get("labels", []) or [])
+
+   graph_name = "my_graph_name"
+
+   def quote_ident(name: str) -> str:
+       return "`" + name.replace("`", "``") + "`"
+
+   for label in sorted(l for l in labels if isinstance(l, str) and l):
+       print(
+           f'GRAPH.QUERY {graph_name} "CREATE INDEX FOR (u:{quote_ident(label)}) ON (u.id);"'
+       )
+   PY
+   ```
+5. **Import into FalkorDB** using `falkordb-bulk-loader` (see [Loading Data into FalkorDB](#loading-data-into-falkordb) below)
 
 ## Real Example: Twitter Dataset
 
@@ -267,8 +290,31 @@ python3 neptune_to_falkordb_converter.py -i ./neptune_export -o ./falkordb_csv
 
 # (Optional) generate typed headers for strict loading
 # python3 neptune_to_falkordb_converter.py -i ./neptune_export -o ./falkordb_csv --enforce-schema
+# Phase 1 (recommended for large datasets): create id indexes on all node labels before load
+# This executes one command per label:
+#   CREATE INDEX FOR (u:<Label>) ON (u.id);
+python3 - <<'PY' | redis-cli -u redis://127.0.0.1:6379 --raw
+import json
+from pathlib import Path
 
-# Load (invokes ../falkordb-bulk-loader/falkordb_bulk_loader/bulk_insert.py)
+manifest = json.loads(Path("./falkordb_csv/bulk_loader_manifest.json").read_text(encoding="utf-8"))
+labels = set(manifest.get("summary", {}).get("node_labels", []) or [])
+if not labels:
+    for node in manifest.get("output", {}).get("nodes", []):
+        labels.update(node.get("labels", []) or [])
+
+graph_name = "my_graph_name"
+
+def quote_ident(name: str) -> str:
+    return "`" + name.replace("`", "``") + "`"
+
+for label in sorted(l for l in labels if isinstance(l, str) and l):
+    print(
+        f'GRAPH.QUERY {graph_name} "CREATE INDEX FOR (u:{quote_ident(label)}) ON (u.id);"'
+    )
+PY
+
+# Phase 2: load (invokes ../falkordb-bulk-loader/falkordb_bulk_loader/bulk_insert.py)
 # If the manifest indicates enforce_schema=true, the helper will automatically pass --enforce-schema.
 python3 bulk_load_to_falkordb.py my_graph_name --csv-dir ./falkordb_csv --server-url redis://127.0.0.1:6379
 
