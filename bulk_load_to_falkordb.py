@@ -72,6 +72,136 @@ def _get_command_arg_value(cmd: List[str], *arg_names: str) -> Optional[str]:
     return None
 
 
+def _scan_issue_snippet(value: str, max_len: int = 120) -> str:
+    shown = (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
+    if len(shown) <= max_len:
+        return shown
+    return shown[: max_len - 3] + "..."
+
+
+def _extract_update_csv_parsing_settings(passthrough: List[str]) -> tuple[str, bool]:
+    separator = ","
+    no_header = False
+
+    i = 0
+    while i < len(passthrough):
+        arg = passthrough[i]
+
+        if arg in ("--separator", "-o"):
+            if i + 1 >= len(passthrough):
+                raise RuntimeError("Missing value for --separator/-o in passthrough arguments")
+            separator = passthrough[i + 1]
+            i += 2
+            continue
+
+        if arg.startswith("--separator="):
+            separator = arg.split("=", 1)[1]
+            i += 1
+            continue
+
+        if arg in ("--no-header", "-n"):
+            no_header = True
+            i += 1
+            continue
+
+        i += 1
+
+    if separator == "":
+        raise RuntimeError("Invalid empty CSV separator for update mode")
+
+    return separator, no_header
+
+
+def _run_update_preflight_scan(
+    *,
+    scan_jobs: List[Dict[str, Any]],
+    separator: str,
+    no_header: bool,
+    fail_on_warning: bool,
+    max_issues_per_file: int,
+) -> None:
+    from scan_bulk_update_csv_risks import scan_file
+
+    print(
+        "Running pre-flight CSV scan for update mode "
+        f"(files={len(scan_jobs)}, separator={separator!r}, no_header={no_header})..."
+    )
+
+    total_errors = 0
+    total_warnings = 0
+
+    for job in scan_jobs:
+        file_path: Path = job["file_path"]
+        file_name: str = job["file_name"]
+        expected_columns: int = int(job["expected_columns"])
+
+        issues, rows_scanned, expected = scan_file(
+            path=file_path,
+            separator=separator,
+            no_header=no_header,
+            expected_columns_override=expected_columns,
+        )
+
+        errors = [issue for issue in issues if issue.severity == "ERROR"]
+        warnings = [issue for issue in issues if issue.severity == "WARN"]
+        total_errors += len(errors)
+        total_warnings += len(warnings)
+
+        if not errors and not warnings:
+            print(
+                f"  ✅ {file_name}: rows={rows_scanned}, expected_columns={expected} "
+                "(no issues)"
+            )
+            continue
+
+        print(
+            f"  ⚠️  {file_name}: rows={rows_scanned}, expected_columns={expected}, "
+            f"ERROR={len(errors)}, WARN={len(warnings)}"
+        )
+
+        report_issues = errors + (warnings if fail_on_warning else [])
+        if report_issues:
+            for issue in report_issues[:max_issues_per_file]:
+                location = f"row {issue.row}"
+                if issue.column is not None:
+                    location += f", col {issue.column}"
+                print(
+                    f"      [{issue.severity}] {issue.code} at {location}: {issue.message} "
+                    f"(value='{_scan_issue_snippet(issue.value)}')"
+                )
+            if len(report_issues) > max_issues_per_file:
+                print(
+                    f"      ... {len(report_issues) - max_issues_per_file} additional "
+                    "issue(s) omitted for brevity"
+                )
+
+    if total_errors > 0 or (fail_on_warning and total_warnings > 0):
+        failure_basis = (
+            f"{total_errors} error(s)"
+            if total_errors > 0
+            else f"{total_warnings} warning(s) with fail-on-warning enabled"
+        )
+        raise RuntimeError(
+            "Update-mode pre-flight CSV scan failed "
+            f"({failure_basis}). Fix the reported issues before running update mode, "
+            "or bypass with --skip-update-preflight-scan."
+        )
+
+    if total_warnings > 0:
+        print(
+            f"Pre-flight CSV scan completed with warnings only "
+            f"(WARN={total_warnings}, ERROR={total_errors}). Proceeding with update mode."
+        )
+    else:
+        print("Pre-flight CSV scan passed with no issues.")
+
+
 def _load_update_queries_csv(path: Path) -> Dict[str, str]:
     if not path.exists():
         raise FileNotFoundError(f"Update queries CSV not found: {path}")
@@ -344,6 +474,25 @@ def main() -> None:
         help="Node property name to index per label (default: id)",
     )
     parser.add_argument(
+        "--skip-update-preflight-scan",
+        action="store_true",
+        help="Skip CSV risk scan pre-flight in --mode update (not recommended).",
+    )
+    parser.add_argument(
+        "--update-preflight-fail-on-warning",
+        action="store_true",
+        help=(
+            "In --mode update, treat scan warnings as fatal "
+            "(default: only scan errors are fatal)."
+        ),
+    )
+    parser.add_argument(
+        "--update-preflight-max-issues",
+        type=int,
+        default=20,
+        help="Maximum scan issues to print per file in --mode update (default: 20).",
+    )
+    parser.add_argument(
         "--enforce-schema",
         dest="enforce_schema",
         action="store_true",
@@ -363,6 +512,8 @@ def main() -> None:
         parser.error("--update-query/--merge-query can only be used with --mode update")
     if args.update_queries_csv and args.mode != "update":
         parser.error("--update-queries-csv can only be used with --mode update")
+    if args.update_preflight_max_issues <= 0:
+        parser.error("--update-preflight-max-issues must be a positive integer")
 
     csv_dir = Path(args.csv_dir)
     manifest = _load_manifest(csv_dir)
@@ -387,6 +538,7 @@ def main() -> None:
         raise RuntimeError("Manifest does not include any node or relation files")
 
     commands: List[List[str]] = []
+    update_scan_jobs: List[Dict[str, Any]] = []
 
     manifest_enforce_schema = bool(manifest.get("options", {}).get("enforce_schema", False))
     enforce_schema = (
@@ -461,7 +613,13 @@ def main() -> None:
             ]
             cmd.extend(passthrough)
             commands.append(cmd)
-
+            update_scan_jobs.append(
+                {
+                    "file_name": str(file_name),
+                    "file_path": csv_dir / str(file_name),
+                    "expected_columns": 1 + len(properties),
+                }
+            )
 
         for r in relations:
             rel_type = r.get("type")
@@ -495,6 +653,13 @@ def main() -> None:
             ]
             cmd.extend(passthrough)
             commands.append(cmd)
+            update_scan_jobs.append(
+                {
+                    "file_name": str(file_name),
+                    "file_path": csv_dir / str(file_name),
+                    "expected_columns": 2 + len(properties),
+                }
+            )
 
     if args.mode == "update" and update_queries:
         unused_update_query_keys = sorted(set(update_queries.keys()) - used_update_query_keys)
@@ -502,6 +667,18 @@ def main() -> None:
             raise RuntimeError(
                 "Some entries in --update-queries-csv did not match any manifest node/relation file: "
                 + ", ".join(unused_update_query_keys)
+            )
+    if args.mode == "update":
+        if args.skip_update_preflight_scan:
+            print("Skipping pre-flight CSV scan for update mode (--skip-update-preflight-scan).")
+        else:
+            separator, no_header = _extract_update_csv_parsing_settings(passthrough)
+            _run_update_preflight_scan(
+                scan_jobs=update_scan_jobs,
+                separator=separator,
+                no_header=no_header,
+                fail_on_warning=args.update_preflight_fail_on_warning,
+                max_issues_per_file=args.update_preflight_max_issues,
             )
 
     if args.dry_run:
