@@ -222,7 +222,9 @@ The converter creates **multiple optimized files**:
        )
    PY
    ```
-5. **Import into FalkorDB** using `falkordb-bulk-loader` (see [Loading Data into FalkorDB](#loading-data-into-falkordb) below)
+5. **Import into FalkorDB** using one of the options in [Loading Data into FalkorDB](#loading-data-into-falkordb):
+   - **Option A**: `falkordb-bulk-loader` via `bulk_load_to_falkordb.py`
+   - **Option B**: `falkordb_csv_loader.py` (after preparing files with `prepare_falkordb_csv_loader_input.py`)
 
 ## Real Example: Twitter Dataset
 
@@ -272,11 +274,15 @@ python3 neptune_to_falkordb_converter.py -i input -o output --verbose
 
 ## Loading Data into FalkorDB
 
-After converting your Neptune data, you can load it into FalkorDB using the **FalkorDB bulk loader**.
+After converting your Neptune data, you can load it into FalkorDB using either:
 
-### Prerequisite: falkordb-bulk-loader
+- the **FalkorDB bulk loader** flow (Options A/C below), or
+- the repository's **CSV loader** flow (Option B below).
 
-Clone the bulk loader next to this repository (or point to it with `--bulk-loader-dir`):
+### Prerequisite for Options A/C: falkordb-bulk-loader
+
+Option B (`falkordb_csv_loader.py`) does not require this clone.  
+For Options A/C, clone the bulk loader next to this repository (or point to it with `--bulk-loader-dir`):
 
 ```bash
 git clone https://github.com/falkordb/falkordb-bulk-loader.git ../falkordb-bulk-loader
@@ -360,7 +366,32 @@ python3 bulk_load_to_falkordb.py my_graph_name --csv-dir ./falkordb_csv --mode u
 In `update` mode, this wrapper auto-generates `--csv` / `--query` for each file.  
 Do not pass `--csv`, `--query`, or `--variable-name` through passthrough args.
 
-### Option B: call bulk_insert.py directly
+### Option B: use falkordb_csv_loader.py (query-based loader)
+
+This path loads CSVs via Cypher through `falkordb_csv_loader.py`.
+
+Before loading, normalize converted files with `prepare_falkordb_csv_loader_input.py` so:
+- filenames follow `nodes_*.csv` / `edges_*.csv`
+- headers are compatible with `falkordb_csv_loader.py`
+- edge files include `source_label` and `target_label` to improve label-specific matching and index usage
+
+```bash
+# Convert Neptune export
+python3 neptune_to_falkordb_converter.py -i ./neptune_export -o ./falkordb_csv
+
+# Prepare files for falkordb_csv_loader.py
+python3 prepare_falkordb_csv_loader_input.py \
+  --input-dir ./falkordb_csv \
+  --output-dir ./falkordb_csv_loader_ready
+
+# Load into FalkorDB
+python3 falkordb_csv_loader.py my_graph_name --csv-dir ./falkordb_csv_loader_ready
+
+# Optional: upsert behavior
+# python3 falkordb_csv_loader.py my_graph_name --csv-dir ./falkordb_csv_loader_ready --merge-mode
+```
+
+### Option C: call bulk_insert.py directly
 
 The converter writes `bulk_loader_manifest.json` which tells you which `-N` (nodes-with-label) and `-R` (relations-with-type) arguments to pass.
 
