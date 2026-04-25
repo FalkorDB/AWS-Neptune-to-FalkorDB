@@ -1,11 +1,16 @@
 # AWS Neptune to FalkorDB (Bulk Loader) CSV Converter
 
-This script converts Amazon Neptune Export Service CSV files into **FalkorDB bulk-loader compatible** CSVs for easy data migration.
+This repository provides a **two-phase migration workflow** for moving Amazon Neptune Export Service data into FalkorDB.
 
-It produces **separate CSV files per unique node label-set and per edge type** (plus a manifest file), so you can load the output directly with `falkordb-bulk-loader`.
+1. **Phase 1 – Conversion**: `neptune_to_falkordb_converter.py` converts Neptune CSV exports into FalkorDB-ready CSV artifacts (separate node/edge files plus a manifest).
+2. **Phase 2 – Loading**: Choose one of two loading paths:
+   - **Bulk loader path** with `bulk_load_to_falkordb.py` (`falkordb-bulk-loader`)
+   - **CSV loader path** with `falkordb_csv_loader.py` (optionally using `prepare_falkordb_csv_loader_input.py`)
 
 ## Features
 
+- **Two-phase migration workflow**: Clear split between conversion (phase 1) and loading (phase 2)
+- **Flexible phase-2 loading options**: Supports both the bulk loader flow and the CSV loader flow
 - **Automatic file detection**: Intelligently finds Neptune export files (vertices.csv, edges.csv, etc.)
 - **Label-based file organization**: Creates separate files per node label and edge type for optimized schemas
 - **Schema preservation**: Maintains all node labels, edge types, and properties
