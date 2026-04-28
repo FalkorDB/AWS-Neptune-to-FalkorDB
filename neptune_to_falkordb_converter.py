@@ -463,6 +463,10 @@ class NeptuneToFalkorDBConverter:
     def convert_edges(self, edge_files: List[Path]) -> None:
         """Convert Neptune edges to bulk-loader compatible relation CSVs."""
         logger.info(f"Converting edges from {len(edge_files)} files: {[f.name for f in edge_files]}")
+        if not self.node_id_to_labels:
+            logger.warning(
+                "Node label mapping is empty; source_label/target_label columns may be blank"
+            )
 
         type_properties: Dict[str, Set[str]] = {}
         type_data: Dict[str, List[Dict[str, Any]]] = {}
@@ -520,10 +524,46 @@ class NeptuneToFalkorDBConverter:
 
                     edge_type = str(edge_type)
                     self.edge_types.add(edge_type)
+                    source_id = str(source)
+                    target_id = str(target)
 
-                    edge_properties: Dict[str, str] = {}
+                    source_labels = self.node_id_to_labels.get(source_id, [])
+                    target_labels = self.node_id_to_labels.get(target_id, [])
+
+                    source_label = ":".join(source_labels) if source_labels else ""
+                    target_label = ":".join(target_labels) if target_labels else ""
+
+                    # Fallback to explicit edge columns, if available.
+                    if not source_label:
+                        source_label = (
+                            row.get('source_label') or row.get('from_label') or row.get('src_label') or ""
+                        )
+                    if not target_label:
+                        target_label = (
+                            row.get('target_label') or row.get('to_label') or row.get('dst_label') or ""
+                        )
+
+                    edge_properties: Dict[str, str] = {
+                        "source_label": str(source_label).strip(),
+                        "target_label": str(target_label).strip(),
+                    }
+                    self.edge_properties.update({"source_label", "target_label"})
                     for col, value in row.items():
-                        if col.startswith('~') or col in ['id', 'label', 'type', 'source', 'target', 'from', 'to']:
+                        if col.startswith('~') or col in [
+                            'id',
+                            'label',
+                            'type',
+                            'source',
+                            'target',
+                            'from',
+                            'to',
+                            'source_label',
+                            'target_label',
+                            'from_label',
+                            'to_label',
+                            'src_label',
+                            'dst_label',
+                        ]:
                             continue
                         if value is None or value == "":
                             continue
@@ -534,12 +574,12 @@ class NeptuneToFalkorDBConverter:
 
                     if edge_type not in type_data:
                         type_data[edge_type] = []
-                        type_properties[edge_type] = set()
+                        type_properties[edge_type] = {"source_label", "target_label"}
 
                     type_data[edge_type].append(
                         {
-                            "source": str(source),
-                            "target": str(target),
+                            "source": source_id,
+                            "target": target_id,
                             "properties": edge_properties,
                         }
                     )
@@ -551,12 +591,19 @@ class NeptuneToFalkorDBConverter:
         for edge_type in sorted(type_data.keys()):
             out_name = self._edgetype_filename(edge_type)
             edges_output = self.output_dir / out_name
-
-            props = sorted(type_properties.get(edge_type, set()))
+            prop_names = type_properties.get(edge_type, set())
+            props: List[str] = []
+            for fixed_prop in ("source_label", "target_label"):
+                if fixed_prop in prop_names:
+                    props.append(fixed_prop)
+            props.extend(sorted(p for p in prop_names if p not in {"source_label", "target_label"}))
 
             prop_types: Dict[str, str] = {}
             if self.enforce_schema:
                 for prop in props:
+                    if prop in {"source_label", "target_label"}:
+                        prop_types[prop] = "STRING"
+                        continue
                     values: List[Any] = []
                     for edge_data in type_data[edge_type]:
                         raw_val = edge_data["properties"].get(prop, "")
@@ -581,6 +628,9 @@ class NeptuneToFalkorDBConverter:
                         raw_val = edge_data["properties"].get(prop, "")
                         if raw_val == "":
                             output_row.append("")
+                            continue
+                        if prop in {"source_label", "target_label"}:
+                            output_row.append(str(raw_val))
                             continue
 
                         parsed_value = self.parse_neptune_property_value(raw_val)

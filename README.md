@@ -14,6 +14,7 @@ This repository provides a **two-phase migration workflow** for moving Amazon Ne
 - **Automatic file detection**: Intelligently finds Neptune export files (vertices.csv, edges.csv, etc.)
 - **Label-based file organization**: Creates separate files per node label and edge type for optimized schemas
 - **Schema preservation**: Maintains all node labels, edge types, and properties
+- **Edge endpoint labels in output**: Writes `source_label` and `target_label` columns in generated edge CSVs
 - **Property handling**: Correctly parses JSON-encoded properties and complex data types
 - **Flexible input formats**: Handles various Neptune export CSV formats including pipe-delimited and line-numbered formats
 - **Smart delimiter detection**: Automatically detects CSV delimiters and line number prefixes
@@ -46,7 +47,7 @@ python3 neptune_to_falkordb_converter.py --input-dir /path/to/neptune/export --o
 
 ### Enforced Schema Output (optional)
 
-If you want the converter to write Neo4j-style typed headers (e.g. `id:ID`, `name:STRING`, `:START_ID`, `:END_ID`) for use with the bulk loader's `--enforce-schema` flag:
+If you want the converter to write Neo4j-style typed headers (e.g. `id:ID`, `name:STRING`, `:START_ID`, `:END_ID`, `source_label:STRING`, `target_label:STRING`) for use with the bulk loader's `--enforce-schema` flag:
 
 ```bash
 python neptune_to_falkordb_converter.py -i /path/to/neptune/export -o /path/to/falkordb/output --enforce-schema
@@ -118,18 +119,18 @@ id,username,verified
 ```
 
 ### Edge Files (edges_*.csv)
-Each output edge file represents a relationship type. The **first two columns are the start and end node identifiers**, and the remaining columns are relationship properties.
+Each output edge file represents a relationship type. The **first two columns are the start and end node identifiers**. Generated edge files also include `source_label` and `target_label`, followed by relationship properties.
 
 **edges_FOLLOWS.csv**:
 ```csv
-source,target,created_at,weight
-1,2,2023-01-15,1.0
+source,target,source_label,target_label,created_at,weight
+1,2,User,User,2023-01-15,1.0
 ```
 
 **edges_MENTIONS.csv**:
 ```csv
-source,target,created_at,weight
-2,1,2023-02-20,0.8
+source,target,source_label,target_label,created_at,weight
+2,1,User,User,2023-02-20,0.8
 ```
 
 ## File Discovery
@@ -153,6 +154,7 @@ The converter handles various Neptune export formats:
 - **Source**: `~from`, `source`, `from`
 - **Target**: `~to`, `target`, `to`
 - **Type**: `~label`, `label`, `type`, `relationship_type`
+- **Endpoint labels in output**: `source_label`, `target_label` (inferred from converted node labels by endpoint ID when possible)
 - **Properties**: Any other non-system columns
 
 ## Data Type Handling
@@ -174,7 +176,7 @@ The converter creates **multiple optimized files**:
 - Example: `nodes_User.csv`, `nodes_Tweet.csv`, `nodes_User__Verified.csv`
 
 ### Edge Files
-- **`edges_*.csv`**: One file per edge type with only relevant properties
+- **`edges_*.csv`**: One file per edge type with endpoint IDs, endpoint label columns (`source_label`, `target_label`), and relevant edge properties
 - Example: `edges_FOLLOWS.csv`, `edges_MENTIONS.csv`, `edges_RETWEETS.csv`
 
 ### Metadata
@@ -251,7 +253,7 @@ python3 neptune_to_falkordb_converter.py -i ./twitter_neptune_export -o ./twitte
 
 **Sample Output Structure:**
 - **nodes_User.csv**: `id,username,followers_count,verified`
-- **edges_FOLLOWS.csv**: `source,target,created_at`
+- **edges_FOLLOWS.csv**: `source,target,source_label,target_label,created_at`
 
 ## Troubleshooting
 
@@ -378,7 +380,7 @@ This path loads CSVs via Cypher through `falkordb_csv_loader.py`.
 Before loading, normalize converted files with `prepare_falkordb_csv_loader_input.py` so:
 - filenames follow `nodes_*.csv` / `edges_*.csv`
 - headers are compatible with `falkordb_csv_loader.py`
-- edge files include `source_label` and `target_label` to improve label-specific matching and index usage
+- edge files preserve `source_label` and `target_label` (and can backfill missing values) to improve label-specific matching and index usage
 
 ```bash
 # Convert Neptune export
