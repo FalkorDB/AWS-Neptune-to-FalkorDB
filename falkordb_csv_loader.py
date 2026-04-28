@@ -27,6 +27,7 @@ class FalkorDBCSVLoader:
         password: str = None,
         merge_mode: bool = False,
         multi_graph_mode: bool = False,
+        debug: bool = False,
     ):
         """
         Initialize FalkorDB connection
@@ -39,6 +40,7 @@ class FalkorDBCSVLoader:
         :param password: FalkorDB password (optional)
         :param merge_mode: If True, use MERGE instead of CREATE for upsert behavior
         :param multi_graph_mode: If True, load each tenant subfolder into separate graphs
+        :param debug: If True, print debug messages before each request sent to FalkorDB
         """
         self.host = host
         self.port = port
@@ -46,6 +48,8 @@ class FalkorDBCSVLoader:
         self.csv_dir = csv_dir
         self.merge_mode = merge_mode
         self.multi_graph_mode = multi_graph_mode
+        self.debug = bool(debug)
+        self.active_graph_name: Optional[str] = None
         
         try:
             print(f"Connecting to FalkorDB at {host}:{port}...")
@@ -53,6 +57,7 @@ class FalkorDBCSVLoader:
             
             if not multi_graph_mode:
                 self.graph = self.db.select_graph(graph_name)
+                self.active_graph_name = graph_name
                 print(f"✅ Connected to FalkorDB graph '{graph_name}'")
             else:
                 self.graph = None  # Will be set per tenant
@@ -60,6 +65,57 @@ class FalkorDBCSVLoader:
         except Exception as e:
             print(f"❌ Failed to connect to FalkorDB: {e}")
             sys.exit(1)
+
+    @staticmethod
+    def _query_preview(query: str, limit: int = 220) -> str:
+        compact = " ".join(str(query).split())
+        if len(compact) > limit:
+            return compact[: limit - 3] + "..."
+        return compact
+
+    def _debug_log(self, message: str) -> None:
+        if not self.debug:
+            return
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{ts}] [DEBUG] {message}")
+
+    def _graph_query(
+        self,
+        query: str,
+        params: Optional[Dict[str, Any]] = None,
+        *,
+        phase: str,
+    ):
+        graph_for_log = self.active_graph_name or self.graph_name
+        preview = self._query_preview(query)
+        if params is None:
+            self._debug_log(
+                f"{phase}: sending GRAPH.QUERY to '{graph_for_log}' and waiting for server response | query={preview}"
+            )
+            return self.graph.query(query)
+
+        params_info = ""
+        if isinstance(params, dict):
+            params_info = f", params_keys={list(params.keys())}"
+            if "batch" in params and isinstance(params["batch"], list):
+                params_info += f", batch_size={len(params['batch'])}"
+        self._debug_log(
+            f"{phase}: sending GRAPH.QUERY to '{graph_for_log}' and waiting for server response{params_info} | query={preview}"
+        )
+        return self.graph.query(query, params)
+
+    def _execute_command(self, *command_args, phase: str, db_client=None):
+        if command_args:
+            command_preview = " ".join(str(arg) for arg in command_args[:8])
+            if len(command_args) > 8:
+                command_preview += " ..."
+        else:
+            command_preview = "<empty command>"
+        self._debug_log(
+            f"{phase}: sending command to FalkorDB and waiting for server response | command={command_preview}"
+        )
+        target_db = db_client or self.db
+        return target_db.execute_command(*command_args)
     
     def read_csv_file(self, file_path: str) -> List[Dict[str, Any]]:
         """Read CSV file and return list of dictionaries"""
@@ -98,7 +154,10 @@ class FalkorDBCSVLoader:
                 # Create index on id property for this label
                 query = f"CREATE INDEX ON :{label}(id)"
                 print(f"  Creating ID index: {query}")
-                result = self.graph.query(query)
+                result = self._graph_query(
+                    query,
+                    phase=f"schema:id-index:{label}",
+                )
                 created_count += 1
                 
             except Exception as e:
@@ -149,7 +208,10 @@ class FalkorDBCSVLoader:
                         # Create regular index
                         query = f"CREATE INDEX ON :{label}({prop})"
                         print(f"  Creating: {query}")
-                        result = self.graph.query(query)
+                        result = self._graph_query(
+                            query,
+                            phase=f"schema:index:{label}.{prop}",
+                        )
                         created_count += 1
                         
                     except Exception as e:
@@ -200,7 +262,10 @@ class FalkorDBCSVLoader:
                         query = f"CREATE INDEX FOR (n:{label}) ON ({prop_str})"
                     
                     print(f"  Creating supporting index: {query}")
-                    result = self.graph.query(query)
+                    result = self._graph_query(
+                        query,
+                        phase=f"schema:supporting-index:{label}",
+                    )
                     created_count += 1
                     
                 except Exception as e:
@@ -258,7 +323,10 @@ class FalkorDBCSVLoader:
                             entity_type, label, 'PROPERTIES', str(len(prop_list))
                         ] + prop_list
                         
-                        result = self.db.execute_command(*command_args)
+                        result = self._execute_command(
+                            *command_args,
+                            phase=f"schema:constraint:{label}",
+                        )
                         created_count += 1
                         print(f"  ✅ Successfully created UNIQUE constraint on {label}({', '.join(prop_list)}), status: {result}")
                     else:
@@ -385,7 +453,11 @@ class FalkorDBCSVLoader:
                 else:
                     unwind_query = f"UNWIND $batch AS row CREATE (n:{label}) SET n.id = row.id, n += row.props"
                 
-                self.graph.query(unwind_query, {'batch': batch_data})
+                self._graph_query(
+                    unwind_query,
+                    {'batch': batch_data},
+                    phase=f"nodes:batch:{label}",
+                )
                 total_loaded += len(batch)
                 
             except Exception as e:
@@ -394,7 +466,10 @@ class FalkorDBCSVLoader:
                 # Fallback to individual queries if batch fails
                 for query in query_parts:
                     try:
-                        self.graph.query(query)
+                        self._graph_query(
+                            query,
+                            phase=f"nodes:fallback-single:{label}",
+                        )
                         total_loaded += 1
                     except Exception as e2:
                         print(f"❌ Error loading node: {e2}")
@@ -601,7 +676,11 @@ class FalkorDBCSVLoader:
                             SET r += row.props
                             """
                     
-                    self.graph.query(unwind_query, {'batch': batch_data})
+                    self._graph_query(
+                        unwind_query,
+                        {'batch': batch_data},
+                        phase=f"edges:batch:{rel_type}",
+                    )
                     total_loaded += len(batch_data)
                     
             except Exception as e:
@@ -610,7 +689,10 @@ class FalkorDBCSVLoader:
                 # Fallback to individual queries if batch fails
                 for query in query_parts:
                     try:
-                        self.graph.query(query)
+                        self._graph_query(
+                            query,
+                            phase=f"edges:fallback-single:{rel_type}",
+                        )
                         total_loaded += 1
                     except Exception as e2:
                         print(f"❌ Error loading edge: {e2}")
@@ -708,7 +790,11 @@ class FalkorDBCSVLoader:
             print(f"{'='*80}\n")
             
             # Switch to this tenant's graph
+            self._debug_log(
+                f"multi-graph:switch: selecting graph '{graph_name}' before sending subsequent requests"
+            )
             self.graph = self.db.select_graph(graph_name)
+            self.active_graph_name = graph_name
             
             # Temporarily update csv_dir to point to tenant directory
             original_csv_dir = self.csv_dir
@@ -739,7 +825,10 @@ class FalkorDBCSVLoader:
         """Verify what attributes were loaded for a specific node type"""
         try:
             query = f"MATCH (n:{label}) RETURN n LIMIT {limit}"
-            result = self.graph.query(query)
+            result = self._graph_query(
+                query,
+                phase=f"verify:sample-nodes:{label}",
+            )
             print(f"\n🔍 Sample {label} nodes with their attributes:")
             for i, record in enumerate(result.result_set):
                 node = record[0]
@@ -752,7 +841,10 @@ class FalkorDBCSVLoader:
         """Get statistics about the loaded graph"""
         try:
             # Count nodes by label
-            node_result = self.graph.query("MATCH (n) RETURN labels(n) as labels, count(n) as count")
+            node_result = self._graph_query(
+                "MATCH (n) RETURN labels(n) as labels, count(n) as count",
+                phase="stats:count-nodes",
+            )
             print("\n📊 Graph Statistics:")
             print("Nodes:")
             for record in node_result.result_set:
@@ -761,7 +853,10 @@ class FalkorDBCSVLoader:
                 print(f"  {labels}: {count}")
             
             # Count relationships by type
-            rel_result = self.graph.query("MATCH ()-[r]->() RETURN type(r) as type, count(r) as count")
+            rel_result = self._graph_query(
+                "MATCH ()-[r]->() RETURN type(r) as type, count(r) as count",
+                phase="stats:count-relationships",
+            )
             print("Relationships:")
             for record in rel_result.result_set:
                 rel_type = record[0]
@@ -855,9 +950,19 @@ class FalkorDBCSVLoader:
         ]
 
         try:
-            acl_db.execute_command(*setuser_args)
+            self._execute_command(
+                *setuser_args,
+                phase=f"acl:setuser:{provision_username}",
+                db_client=acl_db,
+            )
             # Validate existence (do not print secrets).
-            acl_db.execute_command("ACL", "GETUSER", provision_username)
+            self._execute_command(
+                "ACL",
+                "GETUSER",
+                provision_username,
+                phase=f"acl:getuser:{provision_username}",
+                db_client=acl_db,
+            )
         except Exception as e:
             raise RuntimeError(f"ACL provisioning failed: {e}")
 
@@ -867,7 +972,14 @@ class FalkorDBCSVLoader:
                 "Make sure you keep the provisioned credentials safe."
             )
             try:
-                acl_db.execute_command("ACL", "SETUSER", "default", "off")
+                self._execute_command(
+                    "ACL",
+                    "SETUSER",
+                    "default",
+                    "off",
+                    phase="acl:disable-default-user",
+                    db_client=acl_db,
+                )
             except Exception as e:
                 raise RuntimeError(f"Failed to disable Redis 'default' user: {e}")
 
@@ -931,6 +1043,7 @@ Examples:
     parser.add_argument('--csv-dir', default='csv_output', help='Directory containing CSV files (default: csv_output)')
     parser.add_argument('--merge-mode', action='store_true', help='Use MERGE instead of CREATE for upsert behavior')
     parser.add_argument('--multi-graph', action='store_true', help='Enable multi-graph mode: load each tenant_* subfolder into a separate graph')
+    parser.add_argument('--debug', action='store_true', help='Enable debug logs before each request sent to FalkorDB')
 
     args = parser.parse_args()
 
@@ -951,6 +1064,7 @@ Examples:
         password=args.password,
         merge_mode=args.merge_mode,
         multi_graph_mode=args.multi_graph,
+        debug=args.debug,
     )
 
     try:
