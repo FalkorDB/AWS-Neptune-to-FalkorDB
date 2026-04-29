@@ -134,17 +134,21 @@ class NeptuneToFalkorDBConverter:
                         f.seek(0)
                         headers = next(csv.reader(f))
 
-                    # Verify edge-like structure (~from, ~to, or source, target)
-                    if (
-                        any(h in ['~from', '~to', 'source', 'target', 'from', 'to'] for h in headers)
-                        or any('from' in h.lower() or 'to' in h.lower() for h in headers)
-                    ):
+                    # Verify edge-like structure by exact endpoint column names only.
+                    # IMPORTANT: avoid substring checks (e.g. "risk_indicator" contains "to").
+                    normalized_headers = {
+                        str(h).strip().strip('"').strip("'").lower() for h in headers if h is not None
+                    }
+                    edge_endpoint_headers = {'~from', '~to', 'source', 'target', 'from', 'to'}
+                    node_id_headers = {'~id', 'id', 'vertex_id'}
+
+                    if any(h in edge_endpoint_headers for h in normalized_headers):
                         files['edge_files'].append(csv_file)
                         classified_files.add(csv_file)
                         logger.debug(f"Classified {csv_file.name} as edge file (headers: {headers[:5]})")
                     elif (
-                        any(h in ['~id', 'id', 'vertex_id'] for h in headers)
-                        and not any(h in ['~from', '~to', 'source', 'target', 'from', 'to'] for h in headers)
+                        any(h in node_id_headers for h in normalized_headers)
+                        and not any(h in edge_endpoint_headers for h in normalized_headers)
                     ):
                         files['node_files'].append(csv_file)
                         classified_files.add(csv_file)
