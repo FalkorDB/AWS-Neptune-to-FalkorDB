@@ -352,19 +352,15 @@ python3 bulk_load_to_falkordb.py my_graph_name --csv-dir ./falkordb_csv --mode u
 # Optional: if your ID property is not named 'id'
 #   --id-property <property_name>   (also used by --mode update to match source/target nodes)
 ```
-#### Tested update-mode flow (from-scratch recovery path)
+#### Tested update-mode flow (clean large-dataset load)
 
-If a previous update run was interrupted and subsequent writes appear stuck, this flow resets and reloads cleanly without assuming a specific schema.
+Use this flow for a clean, fresh load of a large converted dataset in update mode.
 
 ```bash
 export GRAPH_NAME="my_graph_name"
 export CSV_DIR="./falkordb_csv"
 export SERVER_URL="redis://127.0.0.1:6379"
-# 1) Stop any active loader process
-pids=$(pgrep -f "bulk_load_to_falkordb.py|falkordb_bulk_loader/bulk_update.py|falkordb_bulk_loader/bulk_insert.py" || true)
-if [ -n "$pids" ]; then kill $pids; fi
-
-# 2) Delete the target graph
+# 1) Reset the target graph (delete if it already exists)
 python3 - <<'PY'
 import os
 from falkordb import FalkorDB
@@ -377,8 +373,7 @@ except Exception:
     pass
 print(f"reset graph: {os.environ['GRAPH_NAME']}")
 PY
-
-# 3) Recreate graph + pre-create node id indexes from manifest labels
+# 2) Create graph + pre-create node id indexes from manifest labels
 python3 - <<'PY'
 import json
 import os
@@ -407,16 +402,14 @@ for label in sorted(l for l in labels if isinstance(l, str) and l):
             raise
 print(f"prepared {len(labels)} node label index(es)")
 PY
-
-# 4) Reload with smaller update batches (8 MB token chunks)
+# 3) Run update-mode load with smaller batches (8 MB token chunks)
 python3 bulk_load_to_falkordb.py "$GRAPH_NAME" \
   --csv-dir "$CSV_DIR" \
   --mode update \
   --server-url "$SERVER_URL" \
   --create-id-indexes \
   -- -t 8
-
-# 5) Validate loaded counts by node labels and relation types from manifest
+# 4) Validate loaded counts by node labels and relation types from manifest
 python3 - <<'PY'
 import json
 import os
