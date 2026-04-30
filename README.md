@@ -352,6 +352,110 @@ python3 bulk_load_to_falkordb.py my_graph_name --csv-dir ./falkordb_csv --mode u
 # Optional: if your ID property is not named 'id'
 #   --id-property <property_name>   (also used by --mode update to match source/target nodes)
 ```
+#### Tested update-mode flow (from-scratch recovery path)
+
+If a previous update run was interrupted and subsequent writes appear stuck, this flow resets and reloads cleanly without assuming a specific schema.
+
+```bash
+export GRAPH_NAME="my_graph_name"
+export CSV_DIR="./falkordb_csv"
+export SERVER_URL="redis://127.0.0.1:6379"
+# 1) Stop any active loader process
+pids=$(pgrep -f "bulk_load_to_falkordb.py|falkordb_bulk_loader/bulk_update.py|falkordb_bulk_loader/bulk_insert.py" || true)
+if [ -n "$pids" ]; then kill $pids; fi
+
+# 2) Delete the target graph
+python3 - <<'PY'
+import os
+from falkordb import FalkorDB
+
+client = FalkorDB.from_url(os.environ["SERVER_URL"])
+graph = client.select_graph(os.environ["GRAPH_NAME"])
+try:
+    graph.delete()
+except Exception:
+    pass
+print(f"reset graph: {os.environ['GRAPH_NAME']}")
+PY
+
+# 3) Recreate graph + pre-create node id indexes from manifest labels
+python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+from falkordb import FalkorDB
+from redis.exceptions import ResponseError
+
+csv_dir = Path(os.environ["CSV_DIR"])
+manifest = json.loads((csv_dir / "bulk_loader_manifest.json").read_text(encoding="utf-8"))
+labels = set(manifest.get("summary", {}).get("node_labels", []) or [])
+if not labels:
+    for node in manifest.get("output", {}).get("nodes", []):
+        labels.update(node.get("labels", []) or [])
+
+g = FalkorDB.from_url(os.environ["SERVER_URL"]).select_graph(os.environ["GRAPH_NAME"])
+g.query("RETURN 1")
+
+def quote_ident(name: str) -> str:
+    return "`" + name.replace("`", "``") + "`"
+
+for label in sorted(l for l in labels if isinstance(l, str) and l):
+    try:
+        g.query(f"CREATE INDEX FOR (n:{quote_ident(label)}) ON (n.`id`)")
+    except ResponseError as e:
+        if "already" not in str(e).lower():
+            raise
+print(f"prepared {len(labels)} node label index(es)")
+PY
+
+# 4) Reload with smaller update batches (8 MB token chunks)
+python3 bulk_load_to_falkordb.py "$GRAPH_NAME" \
+  --csv-dir "$CSV_DIR" \
+  --mode update \
+  --server-url "$SERVER_URL" \
+  --create-id-indexes \
+  -- -t 8
+
+# 5) Validate loaded counts by node labels and relation types from manifest
+python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+from falkordb import FalkorDB
+
+csv_dir = Path(os.environ["CSV_DIR"])
+manifest = json.loads((csv_dir / "bulk_loader_manifest.json").read_text(encoding="utf-8"))
+
+labels = set(manifest.get("summary", {}).get("node_labels", []) or [])
+if not labels:
+    for node in manifest.get("output", {}).get("nodes", []):
+        labels.update(node.get("labels", []) or [])
+
+relation_types = set()
+for rel in manifest.get("output", {}).get("relations", []):
+    rel_type = rel.get("type")
+    if isinstance(rel_type, str) and rel_type:
+        relation_types.add(rel_type)
+
+g = FalkorDB.from_url(os.environ["SERVER_URL"]).select_graph(os.environ["GRAPH_NAME"])
+
+def quote_ident(name: str) -> str:
+    return "`" + name.replace("`", "``") + "`"
+
+for label in sorted(l for l in labels if isinstance(l, str) and l):
+    q = f"MATCH (n:{quote_ident(label)}) RETURN count(n)"
+    print(q, "=>", g.query(q).result_set)
+
+for rel_type in sorted(relation_types):
+    q = f"MATCH ()-[r:{quote_ident(rel_type)}]->() RETURN count(r)"
+    print(q, "=>", g.query(q).result_set)
+PY
+```
+
+Notes:
+- `-- -t 8` is passed through to `bulk_update.py` and limits update token size to 8 MB chunks.
+- `GRAPH_NAME`, `CSV_DIR`, and `SERVER_URL` are placeholders; set them for your dataset/environment.
+- In converted edge CSVs that include `source_label` / `target_label`, `bulk_load_to_falkordb.py --mode update` generates label-aware endpoint matching for relation updates.
 
 #### `bulk_load_to_falkordb.py` key options
 
@@ -372,6 +476,7 @@ python3 bulk_load_to_falkordb.py my_graph_name --csv-dir ./falkordb_csv --mode u
 
 In `update` mode, this wrapper auto-generates `--csv` / `--query` for each file.  
 Do not pass `--csv`, `--query`, or `--variable-name` through passthrough args.
+Use passthrough after `--` for bulk-update tuning flags, for example `-- -t 8`.
 
 ### Option B: use falkordb_csv_loader.py (query-based loader)
 
@@ -405,11 +510,12 @@ The converter writes `bulk_loader_manifest.json` which tells you which `-N` (nod
 ```bash
 python3 ../falkordb-bulk-loader/falkordb_bulk_loader/bulk_insert.py my_graph_name \
   -u redis://127.0.0.1:6379 \
-  -N User ./falkordb_csv/nodes_User.csv \
-  -R FOLLOWS ./falkordb_csv/edges_FOLLOWS.csv
+  -N NODE_LABEL ./falkordb_csv/nodes_NODE_LABEL.csv \
+  -R REL_TYPE ./falkordb_csv/edges_REL_TYPE.csv
 
 # If you converted with --enforce-schema, add:
 #   --enforce-schema
+# Replace NODE_LABEL and REL_TYPE with values from bulk_loader_manifest.json.
 ```
 
 ## Advanced Features

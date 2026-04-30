@@ -62,6 +62,11 @@ def _cypher_quote_identifier(name: str) -> str:
     # Backtick quoting for labels/properties (escape any backticks by doubling them).
     return "`" + name.replace("`", "``") + "`"
 
+def _cypher_label_expression(label_value: str) -> str:
+    labels = [segment.strip() for segment in str(label_value).split(":") if segment.strip()]
+    return "".join(f":{_cypher_quote_identifier(label)}" for label in labels)
+
+
 def _format_cmd_for_print(cmd: List[str]) -> str:
     return " ".join(shlex.quote(part) for part in cmd)
 
@@ -326,6 +331,66 @@ def _build_node_update_query(
     )
     return " ".join(query_parts)
 
+def _find_property_row_index(
+    *, properties: List[str], property_name: str, start_index: int
+) -> Optional[int]:
+    try:
+        return start_index + properties.index(property_name)
+    except ValueError:
+        return None
+
+
+def _detect_fixed_relation_endpoint_labels(
+    *,
+    csv_path: Path,
+    separator: str,
+    no_header: bool,
+    source_label_row_index: Optional[int],
+    target_label_row_index: Optional[int],
+) -> tuple[Optional[str], Optional[str]]:
+    if source_label_row_index is None or target_label_row_index is None:
+        return None, None
+
+    source_label: Optional[str] = None
+    target_label: Optional[str] = None
+
+    with open(csv_path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.reader(
+            f,
+            delimiter=separator,
+            skipinitialspace=True,
+            quoting=csv.QUOTE_NONE,
+            escapechar="\\",
+        )
+
+        if not no_header:
+            next(reader, None)
+
+        for row in reader:
+            max_required_index = max(source_label_row_index, target_label_row_index)
+            if len(row) <= max_required_index:
+                continue
+
+            row_source_label = str(row[source_label_row_index]).strip()
+            row_target_label = str(row[target_label_row_index]).strip()
+            if not row_source_label or not row_target_label:
+                continue
+
+            if source_label is None:
+                source_label = row_source_label
+            elif source_label != row_source_label:
+                return None, None
+
+            if target_label is None:
+                target_label = row_target_label
+            elif target_label != row_target_label:
+                return None, None
+
+    if source_label and target_label:
+        return source_label, target_label
+    return None, None
+
+
 
 def _build_relation_update_query(
     *,
@@ -333,15 +398,31 @@ def _build_relation_update_query(
     id_property: str,
     properties: List[str],
     property_types: Dict[str, str],
+    source_label: Optional[str] = None,
+    target_label: Optional[str] = None,
+    source_label_row_index: Optional[int] = None,
+    target_label_row_index: Optional[int] = None,
     row_var: str = "row",
 ) -> str:
     rel_type_q = _cypher_quote_identifier(relation_type)
     id_q = _cypher_quote_identifier(id_property)
+    source_label_expr = _cypher_label_expression(source_label) if source_label else ""
+    target_label_expr = _cypher_label_expression(target_label) if target_label else ""
 
-    query_parts: List[str] = [
-        f"MATCH (src {{{id_q}: {row_var}[0]}}), (dst {{{id_q}: {row_var}[1]}})",
-        f"MERGE (src)-[r:{rel_type_q}]->(dst)",
-    ]
+    if source_label_expr and target_label_expr:
+        query_parts: List[str] = [
+            f"MATCH (src{source_label_expr} {{{id_q}: {row_var}[0]}}), "
+            f"(dst{target_label_expr} {{{id_q}: {row_var}[1]}})",
+            f"MERGE (src)-[r:{rel_type_q}]->(dst)",
+        ]
+    else:
+        query_parts = [f"MATCH (src {{{id_q}: {row_var}[0]}}), (dst {{{id_q}: {row_var}[1]}})"]
+        if source_label_row_index is not None and target_label_row_index is not None:
+            query_parts.append(
+                f"WHERE {row_var}[{source_label_row_index}] IN labels(src) "
+                f"AND {row_var}[{target_label_row_index}] IN labels(dst)"
+            )
+        query_parts.append(f"MERGE (src)-[r:{rel_type_q}]->(dst)")
     query_parts.extend(
         _build_property_set_clauses(
             entity_var="r",
@@ -548,6 +629,10 @@ def main() -> None:
     # (strip leading '--' if user used it as a separator).
     if passthrough and passthrough[0] == "--":
         passthrough = passthrough[1:]
+    update_separator = ","
+    update_no_header = False
+    if args.mode == "update":
+        update_separator, update_no_header = _extract_update_csv_parsing_settings(passthrough)
 
     if args.mode == "insert":
         cmd: List[str] = [sys.executable, str(bulk_loader_py), args.graph, "-u", args.server_url]
@@ -630,16 +715,43 @@ def main() -> None:
             file_path = str(csv_dir / file_name)
             properties = list(r.get("properties", []) or [])
             property_types = dict(r.get("property_types", {}) or {})
-            query = _resolve_custom_update_query(
+            resolved_query = _resolve_custom_update_query(
                 file_name=file_name,
                 update_queries=update_queries,
                 used_update_query_keys=used_update_query_keys,
-            ) or args.update_query or _build_relation_update_query(
-                relation_type=str(rel_type),
-                id_property=args.id_property,
-                properties=properties,
-                property_types=property_types,
             )
+            if resolved_query:
+                query = resolved_query
+            elif args.update_query:
+                query = args.update_query
+            else:
+                source_label_row_index = _find_property_row_index(
+                    properties=properties,
+                    property_name="source_label",
+                    start_index=2,
+                )
+                target_label_row_index = _find_property_row_index(
+                    properties=properties,
+                    property_name="target_label",
+                    start_index=2,
+                )
+                fixed_source_label, fixed_target_label = _detect_fixed_relation_endpoint_labels(
+                    csv_path=csv_dir / str(file_name),
+                    separator=update_separator,
+                    no_header=update_no_header,
+                    source_label_row_index=source_label_row_index,
+                    target_label_row_index=target_label_row_index,
+                )
+                query = _build_relation_update_query(
+                    relation_type=str(rel_type),
+                    id_property=args.id_property,
+                    properties=properties,
+                    property_types=property_types,
+                    source_label=fixed_source_label,
+                    target_label=fixed_target_label,
+                    source_label_row_index=source_label_row_index,
+                    target_label_row_index=target_label_row_index,
+                )
             cmd = [
                 sys.executable,
                 str(bulk_loader_py),
@@ -672,11 +784,10 @@ def main() -> None:
         if args.skip_update_preflight_scan:
             print("Skipping pre-flight CSV scan for update mode (--skip-update-preflight-scan).")
         else:
-            separator, no_header = _extract_update_csv_parsing_settings(passthrough)
             _run_update_preflight_scan(
                 scan_jobs=update_scan_jobs,
-                separator=separator,
-                no_header=no_header,
+                separator=update_separator,
+                no_header=update_no_header,
                 fail_on_warning=args.update_preflight_fail_on_warning,
                 max_issues_per_file=args.update_preflight_max_issues,
             )
