@@ -546,7 +546,9 @@ def main() -> None:
         "--create-id-indexes",
         action="store_true",
         help=(
-            "Create node range indexes on the ID property after load. "
+            "Create node range indexes on the ID property. "
+            "In insert mode, indexes are created after load; "
+            "in update mode, indexes are created before running updates. "
             "This requires the optional Python packages 'falkordb' and 'redis'."
         ),
     )
@@ -811,6 +813,14 @@ def main() -> None:
         for cmd in commands:
             print(_format_cmd_for_print(cmd))
         return
+    if args.create_id_indexes and args.mode == "update":
+        labels = sorted(set(_iter_node_labels_from_manifest(manifest)))
+        _create_node_id_indexes(
+            graph_name=args.graph,
+            server_url=args.server_url,
+            labels=labels,
+            id_property=args.id_property,
+        )
     if args.mode == "insert":
         total_input_files = len(nodes) + len(relations)
         if total_input_files > 0:
@@ -833,8 +843,7 @@ def main() -> None:
             print(f"[{command_index}/{total_commands}] loading input file: {csv_display}")
     for cmd in commands:
         subprocess.run(cmd, check=True, env=loader_env)
-
-    if args.create_id_indexes:
+    if args.create_id_indexes and args.mode == "insert":
         labels = sorted(set(_iter_node_labels_from_manifest(manifest)))
         _create_node_id_indexes(
             graph_name=args.graph,
