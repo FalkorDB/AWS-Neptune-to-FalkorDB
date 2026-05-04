@@ -24,6 +24,7 @@ Pass-through arguments:
 import argparse
 import csv
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -603,13 +604,29 @@ def main() -> None:
     )
     used_update_query_keys: Set[str] = set()
 
-    bulk_loader_dir = Path(args.bulk_loader_dir)
+    bulk_loader_dir = Path(args.bulk_loader_dir).resolve()
     loader_script = "bulk_insert.py" if args.mode == "insert" else "bulk_update.py"
     bulk_loader_py = bulk_loader_dir / "falkordb_bulk_loader" / loader_script
     if not bulk_loader_py.exists():
         raise FileNotFoundError(
             f"{loader_script} not found at {bulk_loader_py} (set --bulk-loader-dir accordingly)"
         )
+    loader_cmd_prefix: List[str]
+    loader_env: Optional[Dict[str, str]] = None
+    if args.mode == "update":
+        # Newer bulk_update.py versions use package-relative imports (for example:
+        # "from .stacktrace import ..."), which fail if run as a file path.
+        loader_cmd_prefix = [sys.executable, "-m", "falkordb_bulk_loader.bulk_update"]
+        loader_env = dict(os.environ)
+        existing_pythonpath = loader_env.get("PYTHONPATH")
+        loader_root = str(bulk_loader_dir)
+        loader_env["PYTHONPATH"] = (
+            f"{loader_root}{os.pathsep}{existing_pythonpath}"
+            if existing_pythonpath
+            else loader_root
+        )
+    else:
+        loader_cmd_prefix = [sys.executable, str(bulk_loader_py)]
 
     nodes: List[Dict[str, Any]] = manifest.get("output", {}).get("nodes", [])
     relations: List[Dict[str, Any]] = manifest.get("output", {}).get("relations", [])
@@ -635,7 +652,7 @@ def main() -> None:
         update_separator, update_no_header = _extract_update_csv_parsing_settings(passthrough)
 
     if args.mode == "insert":
-        cmd: List[str] = [sys.executable, str(bulk_loader_py), args.graph, "-u", args.server_url]
+        cmd: List[str] = [*loader_cmd_prefix, args.graph, "-u", args.server_url]
         if enforce_schema:
             cmd.append("--enforce-schema")
 
@@ -686,8 +703,7 @@ def main() -> None:
                 property_types=property_types,
             )
             cmd = [
-                sys.executable,
-                str(bulk_loader_py),
+                *loader_cmd_prefix,
                 args.graph,
                 "-u",
                 args.server_url,
@@ -753,8 +769,7 @@ def main() -> None:
                     target_label_row_index=target_label_row_index,
                 )
             cmd = [
-                sys.executable,
-                str(bulk_loader_py),
+                *loader_cmd_prefix,
                 args.graph,
                 "-u",
                 args.server_url,
@@ -817,7 +832,7 @@ def main() -> None:
             csv_display = Path(csv_path).name if csv_path else "<unknown>"
             print(f"[{command_index}/{total_commands}] loading input file: {csv_display}")
     for cmd in commands:
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True, env=loader_env)
 
     if args.create_id_indexes:
         labels = sorted(set(_iter_node_labels_from_manifest(manifest)))
