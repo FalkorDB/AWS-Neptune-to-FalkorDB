@@ -470,6 +470,34 @@ Notes:
 In `update` mode, this wrapper auto-generates `--csv` / `--query` for each file.  
 Do not pass `--csv`, `--query`, or `--variable-name` through passthrough args.
 Use passthrough after `--` for bulk-update tuning flags, for example `-- -t 8`.
+#### Preflight scan/fix for `bulk_update` CSVs
+
+Use `scan_bulk_update_csv_risks.py` before `--mode update` to detect risky cells/rows.
+You can also rewrite a CSV into a `bulk_update`-safe format before scanning.
+
+```bash
+# Scan only (no rewrite)
+python3 scan_bulk_update_csv_risks.py ./falkordb_csv/edges_FOLLOWS.csv
+
+# Scan with rewrite to default output path:
+#   ./falkordb_csv/edges_FOLLOWS.bulk_update_fixed.csv
+python3 scan_bulk_update_csv_risks.py ./falkordb_csv/edges_FOLLOWS.csv --fix
+
+# Scan with rewrite to an explicit output path
+python3 scan_bulk_update_csv_risks.py ./falkordb_csv/edges_FOLLOWS.csv \
+  --fix \
+  --fix-output ./falkordb_csv_fixed/edges_FOLLOWS.csv
+
+# Scan after rewriting the input file in place
+python3 scan_bulk_update_csv_risks.py ./falkordb_csv/edges_FOLLOWS.csv \
+  --fix \
+  --fix-in-place
+```
+
+Notes:
+- `--fix-output` and `--fix-in-place` require `--fix`.
+- `--fix-in-place` cannot be combined with `--fix-output`.
+- In `--fix` mode, the script rewrites CSV rows using `QUOTE_NONE`-compatible escaping and then scans the rewritten file.
 
 ### Option B: use falkordb_csv_loader.py (query-based loader)
 
