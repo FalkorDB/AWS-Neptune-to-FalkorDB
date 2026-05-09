@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scan CSV input for patterns that can confuse falkordb-bulk-loader bulk_update.
+"""Scan/fix CSV input for patterns that can confuse falkordb-bulk-loader bulk_update.
 
 The scanner mirrors key assumptions from:
   falkordb-bulk-loader/falkordb_bulk_loader/bulk_update.py
@@ -11,6 +11,8 @@ Relevant parser/serialization behavior:
 - Unquoted strings are wrapped in double quotes without escaping embedded quotes
 
 Use this script before running --mode update to detect risky rows/cells early.
+You can also run in --fix mode to rewrite CSV files into a bulk_update-safe
+format by escaping separator characters for QUOTE_NONE parsing.
 """
 
 import argparse
@@ -215,6 +217,56 @@ def _read_header_columns(path: Path, separator: str) -> Optional[int]:
     return len(header)
 
 
+def _default_fixed_output_path(source_path: Path) -> Path:
+    suffix = source_path.suffix if source_path.suffix else ".csv"
+    return source_path.with_name(f"{source_path.stem}.bulk_update_fixed{suffix}")
+
+
+def _rewrite_csv_for_bulk_update(
+    *,
+    source_path: Path,
+    output_path: Path,
+    separator: str,
+) -> int:
+    """Rewrite CSV to a format friendly to bulk_update QUOTE_NONE parsing."""
+    output_path = output_path.resolve()
+    source_path = source_path.resolve()
+    same_file = source_path == output_path
+    temp_output_path = output_path
+    if same_file:
+        temp_output_path = output_path.with_suffix(f"{output_path.suffix}.tmp")
+
+    temp_output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    row_count = 0
+    reader = None
+    try:
+        with open(source_path, "rt", encoding="utf-8", newline="") as src, open(
+            temp_output_path, "wt", encoding="utf-8", newline=""
+        ) as dst:
+            reader = csv.reader(src, delimiter=separator)
+            writer = csv.writer(
+                dst,
+                delimiter=separator,
+                quoting=csv.QUOTE_NONE,
+                escapechar="\\",
+                lineterminator="\n",
+            )
+            for row in reader:
+                writer.writerow(row)
+                row_count += 1
+    except csv.Error as e:
+        line_num = reader.line_num if reader is not None else "unknown"
+        raise RuntimeError(
+            f"CSV rewrite failed near source line {line_num}: {e}"
+        ) from e
+
+    if same_file:
+        temp_output_path.replace(output_path)
+
+    return row_count
+
+
 def scan_file(
     *,
     path: Path,
@@ -321,7 +373,36 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Return non-zero exit code when only WARN issues are found.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--fix",
+        action="store_true",
+        help=(
+            "Rewrite the CSV into a bulk_update-safe format by escaping separator "
+            "characters for QUOTE_NONE parsing before scanning."
+        ),
+    )
+    parser.add_argument(
+        "--fix-output",
+        default=None,
+        help=(
+            "Output path for rewritten CSV when --fix is enabled. "
+            "Default: <input>.bulk_update_fixed.csv"
+        ),
+    )
+    parser.add_argument(
+        "--fix-in-place",
+        action="store_true",
+        help="Rewrite the input CSV in place when --fix is enabled.",
+    )
+
+    args = parser.parse_args()
+    if args.fix_output and not args.fix:
+        parser.error("--fix-output requires --fix.")
+    if args.fix_in_place and not args.fix:
+        parser.error("--fix-in-place requires --fix.")
+    if args.fix_in_place and args.fix_output:
+        parser.error("--fix-in-place cannot be used together with --fix-output.")
+    return args
 
 
 def main() -> int:
@@ -334,8 +415,32 @@ def main() -> int:
         print(f"❌ Not a file: {csv_path}")
         return 2
 
+    scan_path = csv_path
+    if args.fix:
+        try:
+            fix_output_path = (
+                csv_path
+                if args.fix_in_place
+                else (
+                    Path(args.fix_output)
+                    if args.fix_output
+                    else _default_fixed_output_path(csv_path)
+                )
+            )
+            rewritten_rows = _rewrite_csv_for_bulk_update(
+                source_path=csv_path,
+                output_path=fix_output_path,
+                separator=args.separator,
+            )
+            scan_path = fix_output_path
+            print(f"✅ Rewrote CSV for bulk_update parsing: {scan_path}")
+            print(f"   Rows rewritten: {rewritten_rows}")
+        except Exception as e:
+            print(f"❌ Failed to rewrite CSV in --fix mode: {e}")
+            return 2
+
     issues, rows_scanned, expected_columns = scan_file(
-        path=csv_path,
+        path=scan_path,
         separator=args.separator,
         no_header=args.no_header,
         expected_columns_override=args.expected_columns,
@@ -345,7 +450,7 @@ def main() -> int:
     warn_count = sum(1 for issue in issues if issue.severity == "WARN")
     by_code = Counter(issue.code for issue in issues)
 
-    print(f"Scanned file: {csv_path}")
+    print(f"Scanned file: {scan_path}")
     print(f"Rows scanned (data rows): {rows_scanned}")
     if expected_columns is not None:
         print(f"Expected columns: {expected_columns}")
