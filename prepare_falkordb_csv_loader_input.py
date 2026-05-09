@@ -108,12 +108,22 @@ def classify_edge_header(header: str) -> str:
     if upper == ":END_ID" or upper.endswith(":END_ID"):
         return "target"
 
-    if lower in {"source_label", "from_label", "src_label"} or upper.endswith(":START_LABEL"):
+    if (
+        lower in {"source_label", "from_label", "src_label"}
+        or base_lower in {"source_label", "from_label", "src_label"}
+        or upper.endswith(":START_LABEL")
+    ):
         return "source_label"
-    if lower in {"target_label", "to_label", "dst_label"} or upper.endswith(":END_LABEL"):
+    if (
+        lower in {"target_label", "to_label", "dst_label"}
+        or base_lower in {"target_label", "to_label", "dst_label"}
+        or upper.endswith(":END_LABEL")
+    ):
         return "target_label"
-
-    if lower in {"type", "~label", "label", "relationship_type", "rel_type"}:
+    if (
+        lower in {"type", "~label", "label", "relationship_type", "rel_type"}
+        or base_lower in {"type", "label", "relationship_type", "rel_type"}
+    ):
         return "type"
     if upper == ":TYPE" or upper.endswith(":TYPE"):
         return "type"
