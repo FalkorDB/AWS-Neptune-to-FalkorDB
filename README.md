@@ -16,6 +16,7 @@ This repository provides a **two-phase migration workflow** for moving Amazon Ne
 - **Schema preservation**: Maintains all node labels, edge types, and properties
 - **Edge endpoint labels in output**: Writes `source_label` and `target_label` columns in generated edge CSVs
 - **Property handling**: Correctly parses JSON-encoded properties and complex data types
+- **User-defined multi-value fields**: `--multi-value-field` forces selected properties to JSON array literals
 - **Flexible input formats**: Handles various Neptune export CSV formats including pipe-delimited and line-numbered formats
 - **Smart delimiter detection**: Automatically detects CSV delimiters and line number prefixes
 - **Schema documentation**: Generates detailed schema information about the converted data
@@ -59,10 +60,85 @@ python neptune_to_falkordb_converter.py -i /path/to/neptune/export -o /path/to/f
 python3 neptune_to_falkordb_converter.py -i ./twitter_neptune_data -o ./twitter_falkordb_data --verbose
 ```
 
+### Force Specific Fields to Multi-value Arrays
+
+```bash
+python3 neptune_to_falkordb_converter.py \
+  -i ./neptune_export \
+  -o ./falkordb_csv \
+  --multi-value-field tag \
+  --multi-value-field alias
+```
+
+Configured fields are emitted as JSON array literals (for example `["single_value"]` when the source value is scalar). In `bulk_load_to_falkordb.py --mode update`, auto-generated Cypher appends these array values across repeated rows for the same entity instead of overwriting them.
+
+### Handling Multi-value Fields End-to-End (Both Loading Paths)
+
+Use this flow when one or more properties should be treated as arrays.
+
+#### Required converter flags
+
+You must pass the field name(s) with a repeatable `--multi-value-field` flag:
+
+```bash
+python3 neptune_to_falkordb_converter.py \
+  --input-dir ./neptune_export \
+  --output-dir ./falkordb_csv \
+  --multi-value-field tag \
+  --multi-value-field alias
+```
+
+- Required flags: `--input-dir`, `--output-dir`, `--multi-value-field` (repeat for each array field).
+- Result: configured properties are written as JSON array literals in output CSVs and recorded in `bulk_loader_manifest.json`.
+
+#### Path A: `bulk_load_to_falkordb.py`
+
+Insert mode (new graph):
+
+```bash
+python3 bulk_load_to_falkordb.py my_graph_name \
+  --csv-dir ./falkordb_csv \
+  --server-url redis://127.0.0.1:6379
+```
+
+Update mode (existing graph; appends array values for configured multi-value fields):
+
+```bash
+python3 bulk_load_to_falkordb.py my_graph_name \
+  --csv-dir ./falkordb_csv \
+  --mode update \
+  --server-url redis://127.0.0.1:6379
+```
+
+- Required flags for update-append behavior: `--csv-dir` and `--mode update` (plus graph name argument).
+- If you provide `--update-query` or `--update-queries-csv`, you override the wrapper's auto-generated query; include your own append logic there if needed.
+
+#### Path B: `falkordb_csv_loader.py`
+
+First normalize files for the CSV loader:
+
+```bash
+python3 prepare_falkordb_csv_loader_input.py \
+  --input-dir ./falkordb_csv \
+  --output-dir ./falkordb_csv_loader_ready
+```
+
+Then load:
+
+```bash
+python3 falkordb_csv_loader.py my_graph_name \
+  --csv-dir ./falkordb_csv_loader_ready
+```
+
+- Required flags:  
+  - `prepare_falkordb_csv_loader_input.py`: `--input-dir`, `--output-dir`  
+  - `falkordb_csv_loader.py`: graph name argument and `--csv-dir`
+- Optional: add `--merge-mode` to `falkordb_csv_loader.py` for upsert behavior.
+
 ## Command Line Options
 
 ```
-usage: neptune_to_falkordb_converter.py [-h] --input-dir INPUT_DIR --output-dir OUTPUT_DIR [--verbose] [--enforce-schema]
+usage: neptune_to_falkordb_converter.py [-h] --input-dir INPUT_DIR --output-dir OUTPUT_DIR [--verbose] [--enforce-schema] [--multi-value-field MULTI_VALUE_FIELDS]
 
 Convert Neptune Export Service CSV to FalkorDB bulk-loader CSV format
 
@@ -74,6 +150,8 @@ optional arguments:
                         Output directory for FalkorDB CSV files
   --verbose, -v         Enable verbose logging for debugging
   --enforce-schema      Emit typed CSV headers compatible with falkordb-bulk-loader --enforce-schema
+  --multi-value-field MULTI_VALUE_FIELDS
+                        Property field name to force as JSON array output. Repeat this option to configure multiple fields.
 ```
 
 ## Input Format (Neptune Export Service)
