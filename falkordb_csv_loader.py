@@ -9,6 +9,7 @@ Optional: can provision a Redis ACL user for accessing the migrated graph(s).
 
 import os
 import csv
+import json
 import argparse
 import sys
 from datetime import datetime
@@ -116,6 +117,61 @@ class FalkorDBCSVLoader:
         )
         target_db = db_client or self.db
         return target_db.execute_command(*command_args)
+
+    @staticmethod
+    def _is_int_literal(value: str) -> bool:
+        if not value:
+            return False
+        if value[0] == "-":
+            return value[1:].isdigit()
+        return value.isdigit()
+
+    @staticmethod
+    def _is_float_literal(value: str) -> bool:
+        if not value:
+            return False
+        numeric = value[1:] if value.startswith("-") else value
+        return numeric.count(".") == 1 and numeric.replace(".", "", 1).isdigit()
+
+    @staticmethod
+    def _is_valid_array_element(value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, list):
+            return all(FalkorDBCSVLoader._is_valid_array_element(elem) for elem in value)
+        return isinstance(value, (str, int, float, bool))
+
+    def _coerce_property_value(self, raw_value: str) -> Any:
+        value = raw_value.strip()
+
+        # FalkorDB supports list literals like [1, "a", true] for property values.
+        # Parse JSON-style arrays into Python lists so parameterized queries store
+        # them as true array properties, not strings.
+        if value.startswith("[") and value.endswith("]"):
+            try:
+                parsed = json.loads(value)
+                if isinstance(parsed, list) and self._is_valid_array_element(parsed):
+                    return parsed
+                if isinstance(parsed, list):
+                    self._debug_log(
+                        f"array-cast: unsupported array element type in value={raw_value!r}; keeping as string"
+                    )
+            except json.JSONDecodeError:
+                # Keep the original string when array parsing fails.
+                pass
+
+        if self._is_int_literal(value):
+            return int(value)
+
+        if self._is_float_literal(value):
+            return float(value)
+
+        if value.lower() == "true":
+            return True
+        if value.lower() == "false":
+            return False
+
+        return raw_value
     
     def read_csv_file(self, file_path: str) -> List[Dict[str, Any]]:
         """Read CSV file and return list of dictionaries"""
@@ -383,13 +439,7 @@ class FalkorDBCSVLoader:
                     if key not in ['id', 'labels']:
                         # Handle empty values gracefully
                         if value:
-                            # Try to convert to appropriate type
-                            if value.isdigit():
-                                properties[key] = int(value)
-                            elif value.replace('.', '', 1).lstrip('-').isdigit():
-                                properties[key] = float(value)
-                            else:
-                                properties[key] = value
+                            properties[key] = self._coerce_property_value(value)
                         else:
                             properties[key] = None
                 
@@ -432,12 +482,7 @@ class FalkorDBCSVLoader:
                     
                     for key, value in row.items():
                         if key not in ['id', 'labels'] and value:
-                            if value.isdigit():
-                                properties[key] = int(value)
-                            elif value.replace('.', '', 1).lstrip('-').isdigit():
-                                properties[key] = float(value)
-                            else:
-                                properties[key] = value
+                            properties[key] = self._coerce_property_value(value)
                     
                     # Smart ID handling
                     if node_id.isdigit():
@@ -527,14 +572,8 @@ class FalkorDBCSVLoader:
                             parts = key.split(':')
                             if len(parts) == 2 and parts[0] == parts[1]:
                                 clean_key = parts[0]
-                        
-                        # Try to convert to appropriate type
-                        if value.isdigit():
-                            properties[clean_key] = int(value)
-                        elif value.replace('.', '', 1).isdigit():
-                            properties[clean_key] = float(value)
-                        else:
-                            properties[clean_key] = value
+
+                        properties[clean_key] = self._coerce_property_value(value)
                 
                 # Build property string
                 prop_str = ', '.join([f"{k}: {repr(v)}" for k, v in properties.items()])
@@ -613,13 +652,8 @@ class FalkorDBCSVLoader:
                                 parts = key.split(':')
                                 if len(parts) == 2 and parts[0] == parts[1]:
                                     clean_key = parts[0]
-                            
-                            if value.isdigit():
-                                properties[clean_key] = int(value)
-                            elif value.replace('.', '', 1).isdigit():
-                                properties[clean_key] = float(value)
-                            else:
-                                properties[clean_key] = value
+
+                            properties[clean_key] = self._coerce_property_value(value)
                     
                     # Smart ID handling
                     source_id_value = int(source_id) if source_id.isdigit() else source_id

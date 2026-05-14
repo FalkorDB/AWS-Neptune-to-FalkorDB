@@ -22,12 +22,14 @@ Pass-through arguments:
 """
 
 import argparse
+import atexit
 import csv
 import json
 import os
 import shlex
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set
 
@@ -89,6 +91,141 @@ def _scan_issue_snippet(value: str, max_len: int = 120) -> str:
     if len(shown) <= max_len:
         return shown
     return shown[: max_len - 3] + "..."
+
+def _is_falkordb_compatible_array_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, list):
+        return all(_is_falkordb_compatible_array_value(elem) for elem in value)
+    return isinstance(value, (str, int, float, bool))
+
+
+def _parse_json_array_literal_value(value: str) -> Optional[List[Any]]:
+    text = str(value).strip()
+    if not text:
+        return None
+
+    candidates = [text]
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        candidates.append(text[1:-1].strip())
+
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+
+        # Support values that are themselves JSON strings containing a JSON array.
+        if isinstance(parsed, str):
+            try:
+                parsed = json.loads(parsed)
+            except json.JSONDecodeError:
+                continue
+
+        if isinstance(parsed, list) and _is_falkordb_compatible_array_value(parsed):
+            return parsed
+
+    return None
+
+
+def _array_property_column_indexes(
+    *,
+    properties: List[str],
+    property_types: Dict[str, str],
+    start_index: int,
+    multi_value_fields: Optional[Set[str]] = None,
+) -> List[int]:
+    multi_value_fields = multi_value_fields or set()
+    return [
+        start_index + offset
+        for offset, prop in enumerate(properties)
+        if (property_types or {}).get(prop) == "ARRAY" or prop in multi_value_fields
+    ]
+
+
+def _prepare_update_csv_array_literals(
+    *,
+    csv_path: Path,
+    separator: str,
+    no_header: bool,
+    array_column_indexes: List[int],
+) -> tuple[Path, int]:
+    if not array_column_indexes:
+        return csv_path, 0
+
+    fd, temp_path_str = tempfile.mkstemp(
+        prefix=f"{csv_path.stem}.array_literals.",
+        suffix=csv_path.suffix,
+    )
+    os.close(fd)
+    temp_path = Path(temp_path_str)
+    converted_cells = 0
+
+    try:
+        with open(csv_path, "r", encoding="utf-8", newline="") as in_file, open(
+            temp_path, "w", encoding="utf-8", newline=""
+        ) as out_file:
+            reader = csv.reader(
+                in_file,
+                delimiter=separator,
+                skipinitialspace=True,
+                quoting=csv.QUOTE_NONE,
+                escapechar="\\",
+            )
+            writer = csv.writer(
+                out_file,
+                delimiter=separator,
+                quoting=csv.QUOTE_NONE,
+                escapechar="\\",
+                lineterminator="\n",
+            )
+
+            if not no_header:
+                header = next(reader, None)
+                if header is not None:
+                    writer.writerow(header)
+
+            for row in reader:
+                for col_idx in array_column_indexes:
+                    if col_idx >= len(row):
+                        continue
+
+                    parsed_array = _parse_json_array_literal_value(row[col_idx])
+                    if parsed_array is None:
+                        continue
+
+                    normalized = json.dumps(
+                        parsed_array,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    if row[col_idx] != normalized:
+                        row[col_idx] = normalized
+                        converted_cells += 1
+
+                writer.writerow(row)
+    except Exception:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+    if converted_cells == 0:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+        return csv_path, 0
+
+    def _cleanup_temp_file(path: Path = temp_path) -> None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+    atexit.register(_cleanup_temp_file)
+    return temp_path, converted_cells
 
 
 def _extract_update_csv_parsing_settings(passthrough: List[str]) -> tuple[str, bool]:
@@ -273,16 +410,22 @@ def _build_property_set_clauses(
     start_index: int,
     properties: List[str],
     property_types: Dict[str, str],
+    multi_value_fields: Optional[Set[str]] = None,
 ) -> List[str]:
     clauses: List[str] = []
+    multi_value_fields = multi_value_fields or set()
 
     for offset, prop in enumerate(properties):
         row_idx = start_index + offset
         prop_q = _cypher_quote_identifier(prop)
         raw_value_expr = f"{row_var}[{row_idx}]"
         prop_type = (property_types or {}).get(prop)
-
-        if prop_type == "INT":
+        if prop in multi_value_fields:
+            value_expr = (
+                f"CASE WHEN {entity_var}.{prop_q} IS NULL "
+                f"THEN {raw_value_expr} ELSE {entity_var}.{prop_q} + {raw_value_expr} END"
+            )
+        elif prop_type == "INT":
             value_expr = f"toInteger({raw_value_expr})"
         elif prop_type == "DOUBLE":
             value_expr = f"toFloat({raw_value_expr})"
@@ -312,6 +455,7 @@ def _build_node_update_query(
     id_property: str,
     properties: List[str],
     property_types: Dict[str, str],
+    multi_value_fields: Optional[Set[str]] = None,
     row_var: str = "row",
 ) -> str:
     if not labels:
@@ -328,6 +472,7 @@ def _build_node_update_query(
             start_index=1,
             properties=properties,
             property_types=property_types,
+            multi_value_fields=multi_value_fields,
         )
     )
     return " ".join(query_parts)
@@ -399,6 +544,7 @@ def _build_relation_update_query(
     id_property: str,
     properties: List[str],
     property_types: Dict[str, str],
+    multi_value_fields: Optional[Set[str]] = None,
     source_label: Optional[str] = None,
     target_label: Optional[str] = None,
     source_label_row_index: Optional[int] = None,
@@ -431,6 +577,7 @@ def _build_relation_update_query(
             start_index=2,
             properties=properties,
             property_types=property_types,
+            multi_value_fields=multi_value_fields,
         )
     )
     return " ".join(query_parts)
@@ -601,6 +748,11 @@ def main() -> None:
 
     csv_dir = Path(args.csv_dir)
     manifest = _load_manifest(csv_dir)
+    global_multi_value_fields: Set[str] = {
+        str(field).strip()
+        for field in (manifest.get("options", {}).get("multi_value_fields", []) or [])
+        if str(field).strip()
+    }
     update_queries = (
         _load_update_queries_csv(Path(args.update_queries_csv)) if args.update_queries_csv else {}
     )
@@ -690,10 +842,35 @@ def main() -> None:
             file_name = n.get("file")
             if not labels or not file_name:
                 raise RuntimeError(f"Invalid node entry in manifest: {n}")
-
-            file_path = str(csv_dir / file_name)
+            source_file_path = csv_dir / str(file_name)
             properties = list(n.get("properties", []) or [])
             property_types = dict(n.get("property_types", {}) or {})
+            entry_multi_value_fields = {
+                str(field).strip()
+                for field in (n.get("multi_value_fields", []) or [])
+                if str(field).strip()
+            }
+            multi_value_fields = (global_multi_value_fields | entry_multi_value_fields).intersection(
+                set(properties)
+            )
+            array_column_indexes = _array_property_column_indexes(
+                properties=properties,
+                property_types=property_types,
+                start_index=1,
+                multi_value_fields=multi_value_fields,
+            )
+            prepared_file_path, normalized_cells = _prepare_update_csv_array_literals(
+                csv_path=source_file_path,
+                separator=update_separator,
+                no_header=update_no_header,
+                array_column_indexes=array_column_indexes,
+            )
+            if normalized_cells > 0:
+                print(
+                    f"Normalized {normalized_cells} ARRAY value(s) in {source_file_path.name} for update mode."
+                )
+
+            file_path = str(prepared_file_path)
             query = _resolve_custom_update_query(
                 file_name=file_name,
                 update_queries=update_queries,
@@ -703,6 +880,7 @@ def main() -> None:
                 id_property=args.id_property,
                 properties=properties,
                 property_types=property_types,
+                multi_value_fields=multi_value_fields,
             )
             cmd = [
                 *loader_cmd_prefix,
@@ -719,7 +897,7 @@ def main() -> None:
             update_scan_jobs.append(
                 {
                     "file_name": str(file_name),
-                    "file_path": csv_dir / str(file_name),
+                    "file_path": prepared_file_path,
                     "expected_columns": 1 + len(properties),
                 }
             )
@@ -729,10 +907,35 @@ def main() -> None:
             file_name = r.get("file")
             if not rel_type or not file_name:
                 raise RuntimeError(f"Invalid relation entry in manifest: {r}")
-
-            file_path = str(csv_dir / file_name)
+            source_file_path = csv_dir / str(file_name)
             properties = list(r.get("properties", []) or [])
             property_types = dict(r.get("property_types", {}) or {})
+            entry_multi_value_fields = {
+                str(field).strip()
+                for field in (r.get("multi_value_fields", []) or [])
+                if str(field).strip()
+            }
+            multi_value_fields = (global_multi_value_fields | entry_multi_value_fields).intersection(
+                set(properties)
+            )
+            array_column_indexes = _array_property_column_indexes(
+                properties=properties,
+                property_types=property_types,
+                start_index=2,
+                multi_value_fields=multi_value_fields,
+            )
+            prepared_file_path, normalized_cells = _prepare_update_csv_array_literals(
+                csv_path=source_file_path,
+                separator=update_separator,
+                no_header=update_no_header,
+                array_column_indexes=array_column_indexes,
+            )
+            if normalized_cells > 0:
+                print(
+                    f"Normalized {normalized_cells} ARRAY value(s) in {source_file_path.name} for update mode."
+                )
+
+            file_path = str(prepared_file_path)
             resolved_query = _resolve_custom_update_query(
                 file_name=file_name,
                 update_queries=update_queries,
@@ -754,7 +957,7 @@ def main() -> None:
                     start_index=2,
                 )
                 fixed_source_label, fixed_target_label = _detect_fixed_relation_endpoint_labels(
-                    csv_path=csv_dir / str(file_name),
+                    csv_path=prepared_file_path,
                     separator=update_separator,
                     no_header=update_no_header,
                     source_label_row_index=source_label_row_index,
@@ -765,6 +968,7 @@ def main() -> None:
                     id_property=args.id_property,
                     properties=properties,
                     property_types=property_types,
+                    multi_value_fields=multi_value_fields,
                     source_label=fixed_source_label,
                     target_label=fixed_target_label,
                     source_label_row_index=source_label_row_index,
@@ -785,7 +989,7 @@ def main() -> None:
             update_scan_jobs.append(
                 {
                     "file_name": str(file_name),
-                    "file_path": csv_dir / str(file_name),
+                    "file_path": prepared_file_path,
                     "expected_columns": 2 + len(properties),
                 }
             )

@@ -37,8 +37,13 @@ logger = logging.getLogger(__name__)
 
 class NeptuneToFalkorDBConverter:
     MANIFEST_FILENAME = "bulk_loader_manifest.json"
-
-    def __init__(self, input_dir: str, output_dir: str, enforce_schema: bool = False):
+    def __init__(
+        self,
+        input_dir: str,
+        output_dir: str,
+        enforce_schema: bool = False,
+        multi_value_fields: Optional[Set[str]] = None,
+    ):
         self.input_dir = Path(input_dir)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -46,6 +51,11 @@ class NeptuneToFalkorDBConverter:
         # If True, emit Neo4j-style schema headers (ID/START_ID/END_ID and typed properties)
         # compatible with falkordb-bulk-loader's --enforce-schema mode.
         self.enforce_schema = bool(enforce_schema)
+        self.multi_value_fields: Set[str] = {
+            self._normalize_property_name(field)
+            for field in (multi_value_fields or set())
+            if str(field).strip()
+        }
 
         # Track all property names and labels/types
         self.node_properties: Set[str] = set()
@@ -86,6 +96,49 @@ class NeptuneToFalkorDBConverter:
     def _edgetype_filename(cls, edge_type: str) -> str:
         safe_type = cls._safe_filename_part(edge_type)
         return f"edges_{safe_type}.csv"
+
+    @staticmethod
+    def _normalize_property_name(name: str) -> str:
+        text = str(name).strip()
+        if ":" in text:
+            text = text.split(":", 1)[0].strip()
+        return text
+
+    def _is_multi_value_field(self, property_name: str) -> bool:
+        return self._normalize_property_name(property_name) in self.multi_value_fields
+
+    def _normalize_multi_value_array_item(self, item: Any) -> Optional[Any]:
+        if item is None:
+            return None
+        if isinstance(item, list):
+            normalized_children: List[Any] = []
+            for child in item:
+                normalized_child = self._normalize_multi_value_array_item(child)
+                if normalized_child is not None:
+                    normalized_children.append(normalized_child)
+            return normalized_children
+        if isinstance(item, dict):
+            return json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+        if isinstance(item, (str, int, float, bool)):
+            return item
+        return str(item)
+
+    def _coerce_multi_value_items(self, value: Any) -> List[Any]:
+        parsed_value = self.parse_neptune_property_value(value)
+        if parsed_value is None:
+            return []
+
+        candidates = parsed_value if isinstance(parsed_value, list) else [parsed_value]
+        normalized_items: List[Any] = []
+        for candidate in candidates:
+            normalized = self._normalize_multi_value_array_item(candidate)
+            if normalized is not None:
+                normalized_items.append(normalized)
+        return normalized_items
+
+    @staticmethod
+    def _format_multi_value_items(items: List[Any]) -> str:
+        return json.dumps(items, ensure_ascii=False, separators=(",", ":"))
     def find_neptune_files(self) -> Dict[str, List[Path]]:
         """Find Neptune export files in the input directory.
         
@@ -162,9 +215,16 @@ class NeptuneToFalkorDBConverter:
         
         return files
     
-    def parse_neptune_property_value(self, value: str) -> Any:
+    def parse_neptune_property_value(self, value: Any) -> Any:
         """Parse Neptune property value which might be JSON encoded."""
-        if not value or value == '':
+        if value is None or value == '':
+            return None
+
+        if isinstance(value, (dict, list, bool, int, float)):
+            return value
+
+        value = str(value)
+        if not value:
             return None
         
         # Neptune often stores complex values as JSON strings
@@ -360,7 +420,7 @@ class NeptuneToFalkorDBConverter:
                     self.node_labels.update(labels_set)
 
                     # Merge properties
-                    merged_props: Dict[str, str] = nodes_by_id[node_id]["properties"]
+                    merged_props: Dict[str, Any] = nodes_by_id[node_id]["properties"]
                     for col, value in row.items():
                         if col.startswith('~') or col in ['id', 'label', 'labels']:
                             continue
@@ -369,6 +429,20 @@ class NeptuneToFalkorDBConverter:
 
                         clean_col = col.split(':')[0] if ':' in col else col
                         self.node_properties.add(clean_col)
+                        if self._is_multi_value_field(clean_col):
+                            incoming_items = self._coerce_multi_value_items(value)
+                            if not incoming_items:
+                                continue
+
+                            existing_items = merged_props.get(clean_col)
+                            if existing_items is None:
+                                merged_props[clean_col] = list(incoming_items)
+                            else:
+                                if not isinstance(existing_items, list):
+                                    existing_items = self._coerce_multi_value_items(existing_items)
+                                existing_items.extend(incoming_items)
+                                merged_props[clean_col] = existing_items
+                            continue
 
                         # Prefer the first non-empty value; log conflicts at debug level.
                         if clean_col not in merged_props:
@@ -391,7 +465,7 @@ class NeptuneToFalkorDBConverter:
                 labelset_data[labels_key] = []
                 labelset_properties[labels_key] = set()
 
-            props: Dict[str, str] = node.get("properties", {})
+            props: Dict[str, Any] = node.get("properties", {})
             labelset_data[labels_key].append({"id": node_id, "properties": props})
             labelset_properties[labels_key].update(props.keys())
 
@@ -406,15 +480,21 @@ class NeptuneToFalkorDBConverter:
             props = sorted(labelset_properties.get(labels_key, set()))
 
             prop_types: Dict[str, str] = {}
+            for prop in props:
+                if self._is_multi_value_field(prop):
+                    prop_types[prop] = "ARRAY"
+                    continue
+                if not self.enforce_schema:
+                    continue
+                values: List[Any] = []
+                for node_data in labelset_data[labels_key]:
+                    raw_val = node_data["properties"].get(prop, "")
+                    if raw_val == "":
+                        continue
+                    values.append(self.parse_neptune_property_value(raw_val))
+                prop_types[prop] = self._infer_schema_type(values)
+
             if self.enforce_schema:
-                for prop in props:
-                    values: List[Any] = []
-                    for node_data in labelset_data[labels_key]:
-                        raw_val = node_data["properties"].get(prop, "")
-                        if raw_val == "":
-                            continue
-                        values.append(self.parse_neptune_property_value(raw_val))
-                    prop_types[prop] = self._infer_schema_type(values)
 
                 headers = ["id:ID"] + [f"{prop}:{prop_types[prop]}" for prop in props]
             else:
@@ -430,6 +510,11 @@ class NeptuneToFalkorDBConverter:
                         raw_val = node_data["properties"].get(prop, "")
                         if raw_val == "":
                             output_row.append("")
+                            continue
+                        if self._is_multi_value_field(prop):
+                            output_row.append(
+                                self._format_multi_value_items(self._coerce_multi_value_items(raw_val))
+                            )
                             continue
 
                         parsed_value = self.parse_neptune_property_value(raw_val)
@@ -452,7 +537,10 @@ class NeptuneToFalkorDBConverter:
                 "count": len(labelset_data[labels_key]),
                 "properties": props,
             }
-            if self.enforce_schema:
+            node_multi_value_fields = [prop for prop in props if self._is_multi_value_field(prop)]
+            if node_multi_value_fields:
+                node_manifest_entry["multi_value_fields"] = node_multi_value_fields
+            if prop_types:
                 node_manifest_entry["property_types"] = prop_types
             self._generated_node_files.append(node_manifest_entry)
 
@@ -547,7 +635,7 @@ class NeptuneToFalkorDBConverter:
                             row.get('target_label') or row.get('to_label') or row.get('dst_label') or ""
                         )
 
-                    edge_properties: Dict[str, str] = {
+                    edge_properties: Dict[str, Any] = {
                         "source_label": str(source_label).strip(),
                         "target_label": str(target_label).strip(),
                     }
@@ -574,7 +662,10 @@ class NeptuneToFalkorDBConverter:
 
                         clean_col = col.split(':')[0] if ':' in col else col
                         self.edge_properties.add(clean_col)
-                        edge_properties[clean_col] = value
+                        if self._is_multi_value_field(clean_col):
+                            edge_properties[clean_col] = self._coerce_multi_value_items(value)
+                        else:
+                            edge_properties[clean_col] = value
 
                     if edge_type not in type_data:
                         type_data[edge_type] = []
@@ -603,19 +694,25 @@ class NeptuneToFalkorDBConverter:
             props.extend(sorted(p for p in prop_names if p not in {"source_label", "target_label"}))
 
             prop_types: Dict[str, str] = {}
-            if self.enforce_schema:
-                for prop in props:
-                    if prop in {"source_label", "target_label"}:
+            for prop in props:
+                if prop in {"source_label", "target_label"}:
+                    if self.enforce_schema:
                         prop_types[prop] = "STRING"
+                    continue
+                if self._is_multi_value_field(prop):
+                    prop_types[prop] = "ARRAY"
+                    continue
+                if not self.enforce_schema:
+                    continue
+                values: List[Any] = []
+                for edge_data in type_data[edge_type]:
+                    raw_val = edge_data["properties"].get(prop, "")
+                    if raw_val == "":
                         continue
-                    values: List[Any] = []
-                    for edge_data in type_data[edge_type]:
-                        raw_val = edge_data["properties"].get(prop, "")
-                        if raw_val == "":
-                            continue
-                        values.append(self.parse_neptune_property_value(raw_val))
-                    prop_types[prop] = self._infer_schema_type(values)
+                    values.append(self.parse_neptune_property_value(raw_val))
+                prop_types[prop] = self._infer_schema_type(values)
 
+            if self.enforce_schema:
                 headers = [":START_ID", ":END_ID"] + [
                     f"{prop}:{prop_types[prop]}" for prop in props
                 ]
@@ -635,6 +732,11 @@ class NeptuneToFalkorDBConverter:
                             continue
                         if prop in {"source_label", "target_label"}:
                             output_row.append(str(raw_val))
+                            continue
+                        if self._is_multi_value_field(prop):
+                            output_row.append(
+                                self._format_multi_value_items(self._coerce_multi_value_items(raw_val))
+                            )
                             continue
 
                         parsed_value = self.parse_neptune_property_value(raw_val)
@@ -657,7 +759,10 @@ class NeptuneToFalkorDBConverter:
                 "count": len(type_data[edge_type]),
                 "properties": props,
             }
-            if self.enforce_schema:
+            edge_multi_value_fields = [prop for prop in props if self._is_multi_value_field(prop)]
+            if edge_multi_value_fields:
+                edge_manifest_entry["multi_value_fields"] = edge_multi_value_fields
+            if prop_types:
                 edge_manifest_entry["property_types"] = prop_types
             self._generated_edge_files.append(edge_manifest_entry)
 
@@ -677,6 +782,7 @@ class NeptuneToFalkorDBConverter:
             },
             "options": {
                 "enforce_schema": self.enforce_schema,
+                "multi_value_fields": sorted(self.multi_value_fields),
             },
             "output": {
                 "nodes": self._generated_node_files,
@@ -687,6 +793,7 @@ class NeptuneToFalkorDBConverter:
                 "edge_types": sorted(self.edge_types),
                 "node_properties": sorted(self.node_properties),
                 "edge_properties": sorted(self.edge_properties),
+                "multi_value_fields": sorted(self.multi_value_fields),
             },
         }
 
@@ -738,6 +845,14 @@ class NeptuneToFalkorDBConverter:
         print(f"Node properties found: {len(self.node_properties)}")
         print(f"Edge types found: {len(self.edge_types)} ({', '.join(sorted(self.edge_types))})")
         print(f"Edge properties found: {len(self.edge_properties)}")
+        print(
+            f"Multi-value fields configured: {len(self.multi_value_fields)}"
+            + (
+                f" ({', '.join(sorted(self.multi_value_fields))})"
+                if self.multi_value_fields
+                else ""
+            )
+        )
         
         print(f"\nOutput files created ({len(node_files) + len(edge_files) + 1} total):")
         print(f"\n  Node files ({len(node_files)}):")
@@ -767,6 +882,16 @@ def main():
         action='store_true',
         help='Emit typed CSV headers compatible with falkordb-bulk-loader --enforce-schema',
     )
+    parser.add_argument(
+        '--multi-value-field',
+        dest='multi_value_fields',
+        action='append',
+        default=[],
+        help=(
+            'Property field name to force as JSON array output. '
+            'Repeat this option to configure multiple fields.'
+        ),
+    )
     
     args = parser.parse_args()
     
@@ -785,7 +910,10 @@ def main():
     
     # Create converter and run
     converter = NeptuneToFalkorDBConverter(
-        args.input_dir, args.output_dir, enforce_schema=args.enforce_schema
+        args.input_dir,
+        args.output_dir,
+        enforce_schema=args.enforce_schema,
+        multi_value_fields=set(args.multi_value_fields or []),
     )
     converter.convert()
 
