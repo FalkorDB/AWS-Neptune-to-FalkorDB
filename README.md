@@ -636,4 +636,4 @@ The converter automatically handles multiple CSV formats:
 
 ## License
 
-This script is provided as-is for Neptune to FalkorDB migration purposes.
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
